@@ -280,17 +280,36 @@ def evaluate(model, loader, device):
     return total_loss / n, total_seg / n, total_occ / n
 
 
-def occ_to_pointcloud(
+# Cube template: 8 vertices relative to origin, 12 triangles (6 faces × 2)
+_CUBE_VERTS = np.array([
+    [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],  # bottom
+    [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],  # top
+], dtype=np.float32)
+
+_CUBE_FACES = np.array([
+    [0, 1, 2], [0, 2, 3],  # bottom
+    [4, 5, 6], [4, 6, 7],  # top
+    [0, 1, 5], [0, 5, 4],  # front
+    [2, 3, 7], [2, 7, 6],  # back
+    [0, 3, 7], [0, 7, 4],  # left
+    [1, 2, 6], [1, 6, 5],  # right
+], dtype=np.int64)
+
+
+def occ_to_voxel_mesh(
     occ: np.ndarray,
     seg: np.ndarray,
     voxel_size: float = 0.1,
     x_range: tuple = (-5.0, 5.0),
     y_range: tuple = (-5.0, 5.0),
-    z_range: tuple = (0.0, 5.0),
+    z_min: float = 0.0,
+    z_height: float = 1.0,
     color: np.ndarray = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Convert BEV occupancy + segmentation to a colored 3D point cloud.
+    Convert BEV occupancy to a proper voxel cube mesh.
+
+    Each occupied cell becomes a 3D cube with 8 vertices and 12 triangles.
 
     Args:
         occ: (H, W) binary occupancy
@@ -299,34 +318,40 @@ def occ_to_pointcloud(
         color: (3,) RGB override, or None to use class colors
 
     Returns:
-        vertices: (N, 3) XYZ in meters
-        colors: (N, 3) RGB [0,1]
+        vertices: (N*8, 3) XYZ
+        faces:    (N*12, 3) triangle indices (global)
+        colors:   (N*8, 3) RGB [0,1]
     """
     ys, xs = np.where(occ > 0)
-    if len(ys) == 0:
-        return np.zeros((1, 3)), np.zeros((1, 3))
+    N = len(ys)
+    if N == 0:
+        return np.zeros((8, 3)), np.zeros((12, 3), dtype=np.int64), np.zeros((8, 3))
 
-    # grid indices → world coords (ego frame)
-    x = xs * voxel_size + x_range[0] + voxel_size / 2
-    y = ys * voxel_size + y_range[0] + voxel_size / 2
+    # per-voxel base position in meters
+    base_x = xs * voxel_size + x_range[0]
+    base_y = ys * voxel_size + y_range[0]
+    base_z = np.full(N, z_min)
 
-    # stack multiple Z layers to give height to the flat BEV
-    z_layers = np.linspace(z_range[0] + 0.3, z_range[1] - 0.3, 5)
-    all_pts = []
-    all_colors = []
-    for z in z_layers:
-        pts = np.stack([x, y, np.full_like(x, z)], axis=-1)
-        all_pts.append(pts)
+    # scale cube template to voxel_size
+    scaled = _CUBE_VERTS * voxel_size  # (8, 3)
 
-        if color is not None:
-            all_colors.append(np.tile(color, (len(x), 1)))
-        else:
-            cls_colors = BEV_COLORS[seg[ys, xs].clip(0, NUM_BEV_CLASSES - 1)].astype(np.float32) / 255.0
-            all_colors.append(cls_colors)
+    # offset each voxel's8 vertices
+    # offsets: (N, 1, 3) + (1, 8, 3) → (N, 8, 3)
+    offsets = np.stack([base_x, base_y, base_z], axis=-1)[:, np.newaxis, :]
+    all_verts = (scaled[np.newaxis, :, :] + offsets).reshape(-1, 3)
 
-    vertices = np.concatenate(all_pts, axis=0)
-    colors = np.concatenate(all_colors, axis=0)
-    return vertices, colors
+    # faces: offset per-voxel face indices by voxel index * 8
+    face_offsets = (np.arange(N) * 8)[:, np.newaxis, np.newaxis]
+    all_faces = (_CUBE_FACES[np.newaxis, :, :] + face_offsets).reshape(-1, 3)
+
+    # colors: one color per vertex, same for all8 verts of a voxel
+    if color is not None:
+        voxel_colors = np.tile(color, (N, 1))  # (N, 3)
+    else:
+        voxel_colors = BEV_COLORS[seg[ys, xs].clip(0, NUM_BEV_CLASSES - 1)].astype(np.float32) / 255.0
+    all_colors = np.repeat(voxel_colors, 8, axis=0)  # (N*8, 3)
+
+    return all_verts, all_faces, all_colors
 
 
 def log_3d_occupancy(
@@ -338,34 +363,38 @@ def log_3d_occupancy(
     epoch: int,
     name: str = "occupancy3d",
     voxel_size: float = 0.1,
+    z_height: float = 2.0,
 ):
     """
-    Log GT and predicted occupancy as 3D point clouds to TensorBoard.
+    Log GT and predicted occupancy as 3D voxel cubes to TensorBoard.
 
-    GT = class-colored, Pred = red-tinted
+    GT cubes are class-colored (placed at z=0).
+    Predicted cubes are red-tinted (placed at z=z_height+1, offset on Y).
     """
-    gt_verts, gt_colors = occ_to_pointcloud(gt_occ, gt_seg, voxel_size)
-    pred_verts, pred_colors = occ_to_pointcloud(
+    gt_v, gt_f, gt_c = occ_to_voxel_mesh(
+        gt_occ, gt_seg, voxel_size, z_min=0.0, z_height=z_height,
+    )
+    pred_v, pred_f, pred_c = occ_to_voxel_mesh(
         pred_occ, pred_seg, voxel_size,
-        color=np.array([0.9, 0.2, 0.2]),  # red for predicted
+        z_min=z_height + 1.0,
+        color=np.array([0.9, 0.2, 0.2]),
     )
 
-    # offset predicted along X so they sit side-by-side
-    offset_x = 12.0  # meters
-    pred_verts[:, 0] += offset_x
+    # offset predicted along Y so they sit side-by-side
+    offset_y = 12.0
+    pred_v[:, 1] += offset_y
 
     # combine
-    all_verts = np.concatenate([gt_verts, pred_verts], axis=0)
-    all_colors = np.concatenate([gt_colors, pred_colors], axis=0)
-
-    # TensorBoard add_mesh expects (1, N, 3) tensors
-    vertices_t = torch.from_numpy(all_verts).float().unsqueeze(0)
-    colors_t = torch.from_numpy(all_colors).float().unsqueeze(0)
+    n_gt = gt_v.shape[0]
+    all_verts = np.concatenate([gt_v, pred_v], axis=0)
+    all_faces = np.concatenate([gt_f, pred_f + n_gt], axis=0)  # offset face indices
+    all_colors = np.concatenate([gt_c, pred_c], axis=0)
 
     writer.add_mesh(
         name,
-        vertices=vertices_t,
-        colors=colors_t,
+        vertices=torch.from_numpy(all_verts).float().unsqueeze(0),
+        faces=torch.from_numpy(all_faces).long().unsqueeze(0),
+        colors=torch.from_numpy(all_colors).float().unsqueeze(0),
         global_step=epoch,
     )
 
