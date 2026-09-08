@@ -21,6 +21,7 @@ kv.put_npz("/train/sample_000000",
     depth_gt=np.ones((100, 100), dtype=np.float32),
     seg_gt=np.zeros((100, 100), dtype=np.uint8),
     occ_gt=np.ones((100, 100), dtype=np.uint8),
+    bev_seg_gt=np.zeros((100, 100), dtype=np.uint8),
     K=np.eye(3, dtype=np.float32),
 )
 print("PUT: OK")
@@ -48,6 +49,7 @@ for i in range(1, 6):
         depth_gt=np.random.rand(100, 100).astype(np.float32),
         seg_gt=np.random.randint(0, 10, (100, 100), dtype=np.uint8),
         occ_gt=np.random.randint(0, 2, (100, 100), dtype=np.uint8),
+        bev_seg_gt=np.random.randint(0, 10, (100, 100), dtype=np.uint8),
         K=np.eye(3, dtype=np.float32),
     )
 print(f"PUT 5 more: OK, total /train/ count = {kv.count('/train/')}")

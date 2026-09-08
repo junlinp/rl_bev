@@ -225,6 +225,7 @@ def collect(
 
             seg_gt = seg_image   # IMAGE-SPACE segmentation (camera view)
             occ_gt = occ_head(result["occupancy_count"])  # BEV occupancy grid
+            bev_seg_gt = bev.get_bev_semantic(result["class_histogram"])  # BEV per-cell class
 
             # ── quality filter ──
             n_occupied = occ_gt.sum()
@@ -254,6 +255,7 @@ def collect(
                     depth_gt=depth,
                     seg_gt=seg_gt,
                     occ_gt=occ_gt,
+                    bev_seg_gt=bev_seg_gt,
                     K=rig.K,
                 )
                 kv.put(key, buf.getvalue())
@@ -270,6 +272,7 @@ def collect(
                     depth_gt=depth,
                     seg_gt=seg_gt,
                     occ_gt=occ_gt,
+                    bev_seg_gt=bev_seg_gt,
                     K=rig.K,
                 )
 
