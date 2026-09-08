@@ -9,6 +9,7 @@ Usage:
 """
 
 import os
+import io
 import argparse
 import random
 import numpy as np
@@ -23,6 +24,7 @@ from stereo_bev.depth import decode_carla_depth
 from stereo_bev.segmentation import remap_segmentation, NUM_BEV_CLASSES, BEV_CLASSES
 from stereo_bev.bev_grid import BEVGrid
 from stereo_bev.query_heads import GeometricSegHead, GeometricOccHead
+from minikeyvalue_client import MiniKV
 
 
 def spawn_npc_traffic(world, tm, ego_vehicle, num_vehicles=15, num_walkers=10):
@@ -116,17 +118,30 @@ def collect(
     num_walkers: int = 10,
     min_occupied: int = 50,  # min occupied cells to keep a sample
     min_classes: int = 2,    # min distinct BEV classes to keep a sample
+    kv_url: str = None,      # minikeyvalue URL (e.g. http://localhost:3000)
 ):
-    train_dir = os.path.join(output_dir, "train")
-    val_dir = os.path.join(output_dir, "val")
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(val_dir, exist_ok=True)
+    kv = MiniKV(kv_url) if kv_url else None
+
+    if kv:
+        # resume from existing counts in minikeyvalue
+        existing_train = kv.count("/train/")
+        existing_val = kv.count("/val/")
+        train_count = existing_train
+        val_count = existing_val
+        print(f"[Collect] minikeyvalue mode: {kv_url}")
+        print(f"[Collect] Existing: {existing_train} train + {existing_val} val")
+    else:
+        train_dir = os.path.join(output_dir, "train")
+        val_dir = os.path.join(output_dir, "val")
+        os.makedirs(train_dir, exist_ok=True)
+        os.makedirs(val_dir, exist_ok=True)
 
     num_val = int(num_samples * val_ratio)
     num_train = num_samples - num_val
 
     print(f"[Collect] Target: {num_train} train + {num_val} val = {num_samples} total")
-    print(f"[Collect] Output: {output_dir}/")
+    if not kv:
+        print(f"[Collect] Output: {output_dir}/")
     print(f"[Collect] Filtering: min_occupied={min_occupied}, min_classes={min_classes}")
 
     client = carla.Client(host, port)
@@ -205,40 +220,58 @@ def collect(
                 continue
 
             depth = decode_carla_depth(data["depth_raw"])
-            seg_bev = remap_segmentation(data["seg_raw"])
-            result = bev.bev_from_frame(depth, seg_bev, rig.K, cam_ext, max_depth=max_depth)
+            seg_image = remap_segmentation(data["seg_raw"])  # image-space segmentation (H, W)
+            result = bev.bev_from_frame(depth, seg_image, rig.K, cam_ext, max_depth=max_depth)
 
-            seg_gt = seg_head(result["class_histogram"])
-            occ_gt = occ_head(result["occupancy_count"])
+            seg_gt = seg_image   # IMAGE-SPACE segmentation (camera view)
+            occ_gt = occ_head(result["occupancy_count"])  # BEV occupancy grid
 
             # ── quality filter ──
             n_occupied = occ_gt.sum()
-            n_classes = len(np.unique(seg_gt[occ_gt > 0]))
+            n_classes = len(np.unique(seg_gt))
 
             if n_occupied < min_occupied or n_classes < min_classes:
                 skipped += 1
                 continue
 
-            # track stats
+            # track stats (image-space)
             for c in range(NUM_BEV_CLASSES):
                 class_stats[c] += (seg_gt == c).sum()
 
             # save
-            if collected < num_train:
-                out_path = os.path.join(train_dir, f"sample_{collected:06d}.npz")
+            if kv:
+                if collected < num_train:
+                    key = f"/train/sample_{train_count:06d}"
+                    train_count += 1
+                else:
+                    key = f"/val/sample_{val_count:06d}"
+                    val_count += 1
+                buf = io.BytesIO()
+                np.savez_compressed(
+                    buf,
+                    left_rgb=data["left_rgb"],
+                    right_rgb=data["right_rgb"],
+                    depth_gt=depth,
+                    seg_gt=seg_gt,
+                    occ_gt=occ_gt,
+                    K=rig.K,
+                )
+                kv.put(key, buf.getvalue())
             else:
-                val_idx = collected - num_train
-                out_path = os.path.join(val_dir, f"sample_{val_idx:06d}.npz")
-
-            np.savez_compressed(
-                out_path,
-                left_rgb=data["left_rgb"],
-                right_rgb=data["right_rgb"],
-                depth_gt=depth,
-                seg_gt=seg_gt,
-                occ_gt=occ_gt,
-                K=rig.K,
-            )
+                if collected < num_train:
+                    out_path = os.path.join(train_dir, f"sample_{collected:06d}.npz")
+                else:
+                    val_idx = collected - num_train
+                    out_path = os.path.join(val_dir, f"sample_{val_idx:06d}.npz")
+                np.savez_compressed(
+                    out_path,
+                    left_rgb=data["left_rgb"],
+                    right_rgb=data["right_rgb"],
+                    depth_gt=depth,
+                    seg_gt=seg_gt,
+                    occ_gt=occ_gt,
+                    K=rig.K,
+                )
 
             collected += 1
             split = "train" if collected <= num_train else "val"
@@ -290,6 +323,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-walkers", type=int, default=10)
     parser.add_argument("--min-occupied", type=int, default=50)
     parser.add_argument("--min-classes", type=int, default=2)
+    parser.add_argument("--kv-url", default=None, help="minikeyvalue URL (e.g. http://localhost:3000)")
     args = parser.parse_args()
 
     collect(
@@ -298,4 +332,5 @@ if __name__ == "__main__":
         val_ratio=args.val_ratio, steps_per_sample=args.steps_per_sample,
         num_vehicles=args.num_vehicles, num_walkers=args.num_walkers,
         min_occupied=args.min_occupied, min_classes=args.min_classes,
+        kv_url=args.kv_url,
     )
