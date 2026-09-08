@@ -9,7 +9,7 @@ from .camera_rig import CameraRig
 from .depth import decode_carla_depth
 from .segmentation import remap_segmentation
 from .bev_grid import BEVGrid
-from .query_heads import GeometricSegHead, GeometricOccHead, HAS_TORCH
+from .query_heads import GeometricOccHead, HAS_TORCH
 from .visualize import draw_bev_map, draw_legend, draw_depth_heatmap
 
 
@@ -98,7 +98,6 @@ def run(
         model.eval()
         print(f"[BEV] Loaded StereoBEVModel on {device}")
     else:
-        seg_head_geo = GeometricSegHead()
         occ_head_geo = GeometricOccHead(min_hits=2.0)
 
     # Camera frame: X=right, Y=down, Z=forward
@@ -134,7 +133,7 @@ def run(
             # ── BEV prediction ──
             if model is not None:
                 # model mode: stereo RGB → BEV
-                bev_classes, occ_map = model.infer(
+                _, occ_map, bev_classes, _ = model.infer(
                     left_rgb, right_rgb, rig.K, device=device,
                 )
                 # decode depth for visualization only
@@ -151,7 +150,7 @@ def run(
                     cam_extrinsic=cam_extrinsic,
                     max_depth=max_depth,
                 )
-                bev_classes = seg_head_geo(bev_result["class_histogram"])
+                bev_classes = bev.get_bev_semantic(bev_result["class_histogram"])
                 occ_map = occ_head_geo(bev_result["occupancy_count"])
 
             # ── visualization ──

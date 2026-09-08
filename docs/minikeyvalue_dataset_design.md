@@ -43,7 +43,7 @@ Optimized for 1MB–1GB blobs (our `.npz` samples are ~2–10MB each, perfect fi
 ## Data Format
 
 Each value is the raw `.npz` bytes (numpy compressed archive).
-Fields inside: `left_rgb, right_rgb, depth_gt, seg_gt, occ_gt, K` (unchanged from current).
+Fields inside: `left_rgb, right_rgb, depth_gt, seg_gt, occ_gt, bev_seg_gt, K` (unchanged from current).
 
 ## Components
 

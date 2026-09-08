@@ -42,6 +42,7 @@ class StereoBEVDataset(Dataset):
       depth_gt:   (H, W) float32 meters
       seg_gt:     (H, W) uint8 — IMAGE-SPACE segmentation (camera view)
       occ_gt:     (bev_h, bev_w) uint8 — BEV occupancy
+      bev_seg_gt: (bev_h, bev_w) uint8 — BEV per-cell semantic class
       K:          (3, 3) float64 intrinsics
     """
 
@@ -77,6 +78,7 @@ class StereoBEVDataset(Dataset):
             torch.from_numpy(d["depth_gt"]).float(),  # (H, W)
             torch.from_numpy(d["seg_gt"]).long(),      # (H, W) image-space
             torch.from_numpy(d["occ_gt"]).float(),      # (bev_h, bev_w)
+            torch.from_numpy(d["bev_seg_gt"]).long(),   # (bev_h, bev_w) BEV per-cell class
         )
 
 
@@ -164,6 +166,24 @@ def render_occ_comparison(
     return np.concatenate([gt_img, pred_img, overlay], axis=1)
 
 
+def render_bev_seg_comparison(
+    bev_seg_gt: np.ndarray,
+    bev_seg_pred: np.ndarray,
+    scale: int = 3,
+) -> np.ndarray:
+    """Side-by-side BEV per-cell semantic class: GT vs predicted."""
+    H, W = bev_seg_gt.shape
+    gt_up = cv2.resize(bev_seg_gt.astype(np.uint8), (W * scale, H * scale), interpolation=cv2.INTER_NEAREST)
+    pred_up = cv2.resize(bev_seg_pred.astype(np.uint8), (W * scale, H * scale), interpolation=cv2.INTER_NEAREST)
+
+    gt_img = colorize_seg(gt_up)
+    pred_img = colorize_seg(pred_up)
+    cv2.putText(gt_img, "GT BEV Seg", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    cv2.putText(pred_img, "Pred BEV Seg", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    return np.concatenate([gt_img, pred_img], axis=1)
+
+
 def make_comparison_panel(
     left_rgb: np.ndarray,
     depth_gt: np.ndarray,
@@ -172,6 +192,8 @@ def make_comparison_panel(
     seg_pred: np.ndarray,
     occ_gt: np.ndarray,
     occ_pred: np.ndarray,
+    bev_seg_gt: np.ndarray,
+    bev_seg_pred: np.ndarray,
 ) -> np.ndarray:
     """
     Full comparison panel for TensorBoard.
@@ -179,6 +201,7 @@ def make_comparison_panel(
     Row 1: left_rgb | GT depth | pred depth
     Row 2: GT seg overlay | pred seg overlay (image space)
     Row 3: GT occ | pred occ | overlay (BEV)
+    Row 4: GT BEV seg | pred BEV seg (BEV per-cell class)
     """
     target_h = 160
 
@@ -214,11 +237,17 @@ def make_comparison_panel(
     occ_vis = resize(occ_vis)
     row3 = occ_vis
 
+    # row 4: BEV semantic class
+    bev_seg_vis = render_bev_seg_comparison(bev_seg_gt, bev_seg_pred, scale=2)
+    bev_seg_vis = resize(bev_seg_vis)
+    row4 = bev_seg_vis
+
     # match widths
-    w = max(row1.shape[1], row2.shape[1], row3.shape[1])
+    w = max(row1.shape[1], row2.shape[1], row3.shape[1], row4.shape[1])
     row1 = pad_to(row1, w)
     row2 = pad_to(row2, w)
     row3 = pad_to(row3, w)
+    row4 = pad_to(row4, w)
 
     # labels
     cv2.putText(row1, "Input", (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
@@ -227,7 +256,7 @@ def make_comparison_panel(
     cv2.putText(row2, "GT Seg (image)", (5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
     cv2.putText(row2, "Pred Seg (image)", (w2 + 5, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
-    return np.concatenate([row1, row2, row3], axis=0)
+    return np.concatenate([row1, row2, row3, row4], axis=0)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -297,20 +326,21 @@ def log_3d_occupancy(writer, gt_occ, pred_occ, epoch, name="occupancy3d",
 
 def evaluate(model, loader, device):
     model.eval()
-    total = {"loss": 0, "seg": 0, "occ": 0}
+    total = {"loss": 0, "seg": 0, "occ": 0, "bev_seg": 0}
     n = 0
     with torch.no_grad():
-        for left_t, right_t, K_t, _, seg_gt, occ_gt in loader:
+        for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt in loader:
             left_t, right_t, K_t = left_t.to(device), right_t.to(device), K_t.to(device)
-            seg_gt, occ_gt = seg_gt.to(device), occ_gt.to(device)
-            seg_logits, occ_logits, _ = model(left_t, right_t, K_t)
-            losses = stereo_bev_loss(seg_logits, occ_logits, seg_gt, occ_gt)
+            seg_gt, occ_gt, bev_seg_gt = seg_gt.to(device), occ_gt.to(device), bev_seg_gt.to(device)
+            seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t)
+            losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
             bs = left_t.size(0)
             total["loss"] += losses["loss"].item() * bs
             total["seg"] += losses["seg_loss"].item() * bs
             total["occ"] += losses["occ_loss"].item() * bs
+            total["bev_seg"] += losses["bev_seg_loss"].item() * bs
             n += bs
-    return total["loss"]/n, total["seg"]/n, total["occ"]/n
+    return total["loss"]/n, total["seg"]/n, total["occ"]/n, total["bev_seg"]/n
 
 
 def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_samples=4):
@@ -319,12 +349,12 @@ def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_
     count = 0
 
     with torch.no_grad():
-        for left_t, right_t, K_t, depth_gt_b, seg_gt_b, occ_gt_b in loader:
+        for left_t, right_t, K_t, depth_gt_b, seg_gt_b, occ_gt_b, bev_seg_gt_b in loader:
             left_t = left_t.to(device)
             right_t = right_t.to(device)
             K_t = K_t.to(device)
 
-            seg_logits, occ_logits, depth_logits = model(left_t, right_t, K_t)
+            seg_logits, occ_logits, bev_seg_logits, depth_logits = model(left_t, right_t, K_t)
 
             B = left_t.size(0)
             for b in range(B):
@@ -334,6 +364,7 @@ def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_
                 # predicted outputs
                 pred_seg = seg_logits[b].argmax(dim=0).cpu().numpy().astype(np.uint8)
                 pred_occ = (torch.sigmoid(occ_logits[b]).squeeze() > 0.5).cpu().numpy().astype(np.uint8)
+                pred_bev_seg = bev_seg_logits[b].argmax(dim=0).cpu().numpy().astype(np.uint8)
 
                 # predicted depth (from model)
                 D = depth_logits.shape[1]
@@ -349,6 +380,7 @@ def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_
                 gt_depth = depth_gt_b[b].numpy()
                 gt_seg = seg_gt_b[b].numpy().astype(np.uint8)
                 gt_occ = occ_gt_b[b].numpy().astype(np.uint8)
+                gt_bev_seg = bev_seg_gt_b[b].numpy().astype(np.uint8)
 
                 # left RGB (denormalize)
                 left_np = left_t[b].cpu().permute(1, 2, 0).numpy()
@@ -361,6 +393,7 @@ def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_
                 panel = make_comparison_panel(
                     left_np, gt_depth, pred_depth,
                     gt_seg, pred_seg, gt_occ, pred_occ,
+                    gt_bev_seg, pred_bev_seg,
                 )
                 writer.add_image(f"val/sample_{count}", panel.transpose(2, 0, 1), epoch)
 
@@ -371,6 +404,10 @@ def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_
                 # dedicated occ comparison (BEV)
                 occ_cmp = render_occ_comparison(gt_occ, pred_occ, scale=3)
                 writer.add_image(f"occ/sample_{count}", occ_cmp.transpose(2, 0, 1), epoch)
+
+                # dedicated BEV semantic comparison
+                bev_seg_cmp = render_bev_seg_comparison(gt_bev_seg, pred_bev_seg, scale=3)
+                writer.add_image(f"bevseg/sample_{count}", bev_seg_cmp.transpose(2, 0, 1), epoch)
 
                 # 3D occupancy mesh
                 log_3d_occupancy(writer, gt_occ, pred_occ, epoch,
@@ -431,15 +468,15 @@ def train(
     print(f"[Train] Training for {epochs} epochs...")
     for epoch in range(start_epoch, epochs):
         model.train()
-        total = {"loss": 0, "seg": 0, "occ": 0}
+        total = {"loss": 0, "seg": 0, "occ": 0, "bev_seg": 0}
         n = 0
 
-        for left_t, right_t, K_t, _, seg_gt, occ_gt in train_loader:
+        for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt in train_loader:
             left_t, right_t, K_t = left_t.to(device), right_t.to(device), K_t.to(device)
-            seg_gt, occ_gt = seg_gt.to(device), occ_gt.to(device)
+            seg_gt, occ_gt, bev_seg_gt = seg_gt.to(device), occ_gt.to(device), bev_seg_gt.to(device)
 
-            seg_logits, occ_logits, _ = model(left_t, right_t, K_t)
-            losses = stereo_bev_loss(seg_logits, occ_logits, seg_gt, occ_gt)
+            seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t)
+            losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
 
             optimizer.zero_grad()
             losses["loss"].backward()
@@ -449,14 +486,16 @@ def train(
             total["loss"] += losses["loss"].item() * bs
             total["seg"] += losses["seg_loss"].item() * bs
             total["occ"] += losses["occ_loss"].item() * bs
+            total["bev_seg"] += losses["bev_seg_loss"].item() * bs
             n += bs
 
         scheduler.step()
         train_loss = total["loss"] / n
         train_seg = total["seg"] / n
         train_occ = total["occ"] / n
+        train_bev_seg = total["bev_seg"] / n
 
-        val_loss, val_seg, val_occ = evaluate(model, val_loader, device)
+        val_loss, val_seg, val_occ, val_bev_seg = evaluate(model, val_loader, device)
 
         # save checkpoint
         torch.save({
@@ -471,6 +510,7 @@ def train(
         writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch)
         writer.add_scalars("seg_loss", {"train": train_seg, "val": val_seg}, epoch)
         writer.add_scalars("occ_loss", {"train": train_occ, "val": val_occ}, epoch)
+        writer.add_scalars("bev_seg_loss", {"train": train_bev_seg, "val": val_bev_seg}, epoch)
         writer.add_scalar("lr", lr_now, epoch)
 
         if epoch % viz_every == 0 or epoch == epochs - 1:
@@ -478,8 +518,8 @@ def train(
 
         if (epoch + 1) % 5 == 0 or epoch == start_epoch:
             print(f"  epoch {epoch+1:3d}/{epochs}  "
-                  f"train: loss={train_loss:.4f} seg={train_seg:.4f} occ={train_occ:.4f}  "
-                  f"val: loss={val_loss:.4f} seg={val_seg:.4f} occ={val_occ:.4f}  "
+                  f"train: loss={train_loss:.4f} seg={train_seg:.4f} occ={train_occ:.4f} bev_seg={train_bev_seg:.4f}  "
+                  f"val: loss={val_loss:.4f} seg={val_seg:.4f} occ={val_occ:.4f} bev_seg={val_bev_seg:.4f}  "
                   f"lr={lr_now:.6f}", flush=True)
 
     writer.close()

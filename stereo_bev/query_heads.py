@@ -272,6 +272,17 @@ if HAS_TORCH:
             )
         def forward(self, x): return self.head(x)
 
+    class BevSegQueryHead(nn.Module):
+        """BEV semantics: (B, C, H, W) → (B, num_classes, H, W) logits (per-cell class)."""
+        def __init__(self, in_ch, num_classes):
+            super().__init__()
+            self.head = nn.Sequential(
+                nn.Conv2d(in_ch, 64, 3, padding=1, bias=False),
+                nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+                nn.Conv2d(64, num_classes, 1),
+            )
+        def forward(self, x): return self.head(x)
+
     # ── Full Model ──
 
     class StereoBEVModel(nn.Module):
@@ -280,9 +291,10 @@ if HAS_TORCH:
 
         Input:  left_rgb (B, 3, H, W), right_rgb (B, 3, H, W), K (B, 3, 3)
         Output:
-            seg_logits:   (B, num_classes, H, W) — image-space segmentation
-            occ_logits:   (B, 1, bev_h, bev_w) — BEV occupancy
-            depth_logits: (B, D, Hf, Wf) — depth distribution
+            seg_logits:     (B, num_classes, H, W) — image-space segmentation
+            occ_logits:     (B, 1, bev_h, bev_w) — BEV occupancy
+            bev_seg_logits: (B, num_classes, bev_h, bev_w) — per-cell BEV semantic class
+            depth_logits:   (B, D, Hf, Wf) — depth distribution
         """
         def __init__(self, num_classes=10, feat_channels=64, depth_bins=64,
                      image_h=540, image_w=960,
@@ -305,6 +317,7 @@ if HAS_TORCH:
             )
             self.bev_encoder = BEVEncoder(backbone_ch, feat_channels)
             self.occ_head = OccQueryHead(feat_channels)
+            self.bev_seg_head = BevSegQueryHead(feat_channels, num_classes)
 
             self._image_h = image_h
             self._image_w = image_w
@@ -313,9 +326,10 @@ if HAS_TORCH:
         def forward(self, left_rgb, right_rgb, K):
             """
             Returns:
-                seg_logits:   (B, num_classes, H, W) image-space
-                occ_logits:   (B, 1, bev_h, bev_w) BEV
-                depth_logits: (B, D, Hf, Wf)
+                seg_logits:     (B, num_classes, H, W) image-space
+                occ_logits:     (B, 1, bev_h, bev_w) BEV
+                bev_seg_logits: (B, num_classes, bev_h, bev_w) BEV per-cell class
+                depth_logits:   (B, D, Hf, Wf)
             """
             B = left_rgb.shape[0]
             feat_l, skips = self.backbone(left_rgb)    # (B, 256, H/16, W/16)
@@ -332,17 +346,19 @@ if HAS_TORCH:
             bev_feat = self.lifter(feat_l, depth_logits, K)
             bev_feat = self.bev_encoder(bev_feat)
             occ_logits = self.occ_head(bev_feat)
+            bev_seg_logits = self.bev_seg_head(bev_feat)
 
-            return seg_logits, occ_logits, depth_logits
+            return seg_logits, occ_logits, bev_seg_logits, depth_logits
 
         def infer(self, left_rgb, right_rgb, K, device="cpu"):
             """
             Inference from numpy arrays.
 
             Returns:
-                seg_classes: (H, W) uint8 image-space segmentation
-                occ_map:     (bev_h, bev_w) uint8 binary
-                depth_map:   (H, W) float32 meters
+                seg_classes:     (H, W) uint8 image-space segmentation
+                occ_map:         (bev_h, bev_w) uint8 binary
+                bev_seg_classes: (bev_h, bev_w) uint8 per-cell BEV class
+                depth_map:       (H, W) float32 meters
             """
             mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
@@ -357,10 +373,11 @@ if HAS_TORCH:
 
             self.eval()
             with torch.no_grad():
-                seg_logits, occ_logits, depth_logits = self(left_t, right_t, K_t)
+                seg_logits, occ_logits, bev_seg_logits, depth_logits = self(left_t, right_t, K_t)
 
             seg_classes = seg_logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
             occ_map = (torch.sigmoid(occ_logits).squeeze() > 0.5).cpu().numpy().astype(np.uint8)
+            bev_seg_classes = bev_seg_logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
 
             # depth: expected value from distribution
             D = depth_logits.shape[1]
@@ -372,7 +389,7 @@ if HAS_TORCH:
                 mode='bilinear', align_corners=False,
             ).squeeze().cpu().numpy()
 
-            return seg_classes, occ_map, depth_map
+            return seg_classes, occ_map, bev_seg_classes, depth_map
 
 
 # ════════════════════════════════════════════════════════════════
@@ -381,18 +398,26 @@ if HAS_TORCH:
 
 if HAS_TORCH:
 
-    def stereo_bev_loss(seg_logits, occ_logits, seg_gt, occ_gt,
-                        seg_weight=1.0, occ_weight=1.0):
+    def stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt,
+                        seg_weight=1.0, occ_weight=1.0, bev_seg_weight=1.0):
         """
-        Combined loss for image-space segmentation + BEV occupancy.
+        Combined loss for image-space segmentation + BEV occupancy + BEV semantics.
 
         Args:
-            seg_logits: (B, C, H, W) image-space logits
-            occ_logits: (B, 1, bev_h, bev_w) BEV logits
-            seg_gt:     (B, H, W) long — image-space class indices
-            occ_gt:     (B, bev_h, bev_w) float — BEV occupancy
+            seg_logits:     (B, C, H, W) image-space logits
+            occ_logits:     (B, 1, bev_h, bev_w) BEV occupancy logits
+            bev_seg_logits: (B, C, bev_h, bev_w) BEV per-cell class logits
+            seg_gt:         (B, H, W) long — image-space class indices
+            occ_gt:         (B, bev_h, bev_w) float — BEV occupancy
+            bev_seg_gt:     (B, bev_h, bev_w) long — BEV per-cell class indices
         """
         seg_loss = F.cross_entropy(seg_logits, seg_gt)
         occ_loss = F.binary_cross_entropy_with_logits(occ_logits.squeeze(1), occ_gt)
-        total = seg_weight * seg_loss + occ_weight * occ_loss
-        return {"loss": total, "seg_loss": seg_loss, "occ_loss": occ_loss}
+        bev_seg_loss = F.cross_entropy(bev_seg_logits, bev_seg_gt)
+        total = seg_weight * seg_loss + occ_weight * occ_loss + bev_seg_weight * bev_seg_loss
+        return {
+            "loss": total,
+            "seg_loss": seg_loss,
+            "occ_loss": occ_loss,
+            "bev_seg_loss": bev_seg_loss,
+        }
