@@ -1,0 +1,25 @@
+[project]
+name = "rl-bev"
+version = "0.1.0"
+description = "Stereo-to-BEV perception + RL planning pipeline for CARLA"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "torch>=2.1",
+    "torchvision>=0.16",
+    "tensorboard>=2.14",
+]
+
+[project.optional-dependencies]
+# CARLA's PyPI wheels are pinned to a specific simulator release and are only
+# published for Linux/Windows (no macOS wheels) — pin this to match your
+# CARLA server, e.g. `uv sync --extra carla` after setting the version below,
+# or install it manually with `uv pip install carla==<your-server-version>`.
+carla = [
+    "carla",
+]
+
+[tool.uv]
+package = false
