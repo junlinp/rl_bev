@@ -97,30 +97,17 @@ Changes:
 - If `--kv-url` set: use `KVBEVDataset`
 - If not set: use current `StereoBEVDataset` (backward compatible)
 
-### 4. Server setup script — `start_kv.sh`
+### 4. Server (out of repo)
 
-```bash
-#!/bin/bash
-# Build minikeyvalue (one-time)
-# cd minikeyvalue && go build -o mkv . && cd ..
-
-VOLUME_DIR=${1:-/tmp/bev_kv}
-mkdir -p $VOLUME_DIR/vol1
-
-# Start volume server
-PORT=3001 ./mkv/volume $VOLUME_DIR/vol1 &
-
-# Start master
-./mkv/mkv -volumes localhost:3001 -db $VOLUME_DIR/indexdb server &
-```
+This repo does not run minikeyvalue. Start the Go master + volume servers from the minikeyvalue tree, then point `--kv-url` at that master (default `http://localhost:3000`).
 
 ## Append Workflow
 
 The key advantage: **collect_data.py can append new data at any time.**
 
-1. Start minikeyvalue server (one-time)
-2. Run `collect_data.py --kv-url http://localhost:3000 --num-samples 100`
-3. Run `collect_data.py --kv-url http://localhost:3000 --num-samples 100` again
+1. Start minikeyvalue (outside this repo)
+2. Run `collect_data.py --kv-url http://localhost:3000 --samples 100`
+3. Run `collect_data.py --kv-url http://localhost:3000 --samples 100` again
 4. Total dataset is now 200 samples — no conflict
 5. Run `train_bev.py --kv-url http://localhost:3000 --epochs 50`
 6. Trainer sees all 200 samples
@@ -146,9 +133,8 @@ for split in ["train", "val"]:
 
 ## Dependencies
 
-- **minikeyvalue**: Go binary, build once with `go build`
-- **Python**: stdlib only (`urllib.request`, `io`, `numpy`)
-- **nginx**: bundled in minikeyvalue's `volume` script
+- **minikeyvalue**: external HTTP server (not shipped here)
+- **Python client**: stdlib `http.client` + `numpy`
 
 ## Out of scope (future)
 

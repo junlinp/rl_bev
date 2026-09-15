@@ -280,8 +280,8 @@ def collect(
             split = "train" if collected <= num_train else "val"
             if collected % 25 == 0 or collected == num_samples:
                 loc = vehicle.get_location()
-                bev_classes = np.unique(seg_gt[occ_gt > 0])
-                class_names = [BEV_CLASSES.get(int(c), str(c)) for c in bev_classes]
+                occupied_classes = np.unique(bev_seg_gt[occ_gt > 0]) if n_occupied else []
+                class_names = [BEV_CLASSES.get(int(c), str(c)) for c in occupied_classes]
                 print(
                     f"  [{split}] {collected}/{num_samples}  "
                     f"pos=({loc.x:.0f},{loc.y:.0f})  "
@@ -292,20 +292,39 @@ def collect(
                 )
 
     finally:
-        # cleanup NPCs
-        for actor in npcs:
-            if actor.is_alive:
-                actor.destroy()
-        rig.destroy()
-        vehicle.destroy()
-        settings.synchronous_mode = False
-        world.apply_settings(settings)
-        tm.set_synchronous_mode(False)
+        for actor in reversed(npcs):
+            try:
+                if actor.is_alive:
+                    stop = getattr(actor, "stop", None)
+                    if callable(stop):
+                        stop()
+                    actor.destroy()
+            except Exception:
+                pass
+        try:
+            rig.destroy()
+        except Exception:
+            pass
+        try:
+            if vehicle is not None and vehicle.is_alive:
+                vehicle.destroy()
+        except Exception:
+            pass
+        try:
+            settings.synchronous_mode = False
+            world.apply_settings(settings)
+            tm.set_synchronous_mode(False)
+        except Exception:
+            pass
 
     # summary
     print(f"\n[Collect] Done. {collected} saved, {skipped} skipped.")
-    print(f"  Train: {min(collected, num_train)} → {train_dir}/")
-    print(f"  Val:   {max(0, collected - num_train)} → {val_dir}/")
+    if kv:
+        print(f"  Train: {kv.count('/train/')} → {kv_url}/train/")
+        print(f"  Val:   {kv.count('/val/')} → {kv_url}/val/")
+    else:
+        print(f"  Train: {min(collected, num_train)} → {train_dir}/")
+        print(f"  Val:   {max(0, collected - num_train)} → {val_dir}/")
     print(f"\n  BEV class distribution:")
     total_px = class_stats.sum()
     for c in range(NUM_BEV_CLASSES):

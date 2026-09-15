@@ -7,7 +7,8 @@ The model predicts:
   - BEV occupancy grid (lifted from depth + seg)
 
 Usage:
-  python train_bev.py --data bev_data --epochs 50 --batch-size 2
+    python train_bev.py --kv-url http://localhost:3000 --epochs 50 --batch-size 2
+    python train_bev.py --data bev_data --epochs 50 --batch-size 2
 
 TensorBoard:
   tensorboard --logdir runs/bev_train
@@ -15,11 +16,11 @@ TensorBoard:
 
 import os
 import argparse
+from contextlib import nullcontext
 import numpy as np
 import cv2
 
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -28,11 +29,61 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from stereo_bev.segmentation import NUM_BEV_CLASSES, BEV_CLASSES, BEV_COLORS
 from stereo_bev.query_heads import StereoBEVModel, stereo_bev_loss
+from minikeyvalue_client import MiniKV
 
 
 # ════════════════════════════════════════════════════════════════
 #  Dataset
 # ════════════════════════════════════════════════════════════════
+
+_NPZ_FIELDS = (
+    "left_rgb", "right_rgb", "K", "depth_gt", "seg_gt", "occ_gt", "bev_seg_gt",
+)
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _bgr_to_nchw_uint8(img: np.ndarray) -> torch.Tensor:
+    """BGR uint8 (H, W, 3) → RGB uint8 (3, H, W). Normalization runs on GPU."""
+    rgb = np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1))
+    return torch.from_numpy(rgb)
+
+
+def _imagenet_norm(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    x = x.float().div_(255.0)
+    x.sub_(mean).div_(std)
+    return x
+
+
+def _norm_bufs(device: torch.device):
+    mean = torch.tensor(_IMAGENET_MEAN, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    std = torch.tensor(_IMAGENET_STD, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    return mean, std
+
+
+def _move_batch(left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, device, mean, std, non_blocking):
+    left_t = left_t.to(device, non_blocking=non_blocking)
+    right_t = right_t.to(device, non_blocking=non_blocking)
+    K_t = K_t.to(device, non_blocking=non_blocking)
+    seg_gt = seg_gt.to(device, non_blocking=non_blocking)
+    occ_gt = occ_gt.to(device, non_blocking=non_blocking)
+    bev_seg_gt = bev_seg_gt.to(device, non_blocking=non_blocking)
+    if left_t.dtype == torch.uint8:
+        left_t = _imagenet_norm(left_t, mean, std)
+        right_t = _imagenet_norm(right_t, mean, std)
+    return left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt
+
+
+def _load_npz_file(npz) -> tuple:
+    missing = [k for k in _NPZ_FIELDS if k not in npz.files]
+    if missing:
+        raise KeyError(
+            f"Sample missing {missing}. Re-collect with "
+            "collect_data.py --kv-url http://localhost:3000 "
+            "(run_collect_v2.py samples omit bev_seg_gt)."
+        )
+    return tuple(npz[k] for k in _NPZ_FIELDS)
+
 
 class StereoBEVDataset(Dataset):
     """
@@ -44,41 +95,59 @@ class StereoBEVDataset(Dataset):
       occ_gt:     (bev_h, bev_w) uint8 — BEV occupancy
       bev_seg_gt: (bev_h, bev_w) uint8 — BEV per-cell semantic class
       K:          (3, 3) float64 intrinsics
+
+    Loads from local .npz files or minikeyvalue (`--kv-url`).
     """
 
-    def __init__(self, data_dir: str):
-        self.files = sorted([
-            os.path.join(data_dir, f)
-            for f in os.listdir(data_dir)
-            if f.endswith(".npz")
-        ])
-        if len(self.files) == 0:
-            raise FileNotFoundError(f"No .npz files in {data_dir}")
+    def __init__(self, data_dir: str = None, kv_url: str = None, kv_prefix: str = "/train/"):
+        self.kv_url = kv_url
+        self._kv = None
+        if kv_url:
+            self.keys = MiniKV(kv_url).list_keys(kv_prefix)
+            self.files = None
+            if len(self.keys) == 0:
+                raise FileNotFoundError(f"No keys in KV with prefix {kv_prefix}")
+        else:
+            self.keys = None
+            self.files = sorted([
+                os.path.join(data_dir, f)
+                for f in os.listdir(data_dir)
+                if f.endswith(".npz")
+            ])
+            if len(self.files) == 0:
+                raise FileNotFoundError(f"No .npz files in {data_dir}")
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_kv"] = None
+        return state
+
+    def _client(self) -> MiniKV:
+        if self._kv is None:
+            self._kv = MiniKV(self.kv_url)
+        return self._kv
 
     def __len__(self):
-        return len(self.files)
+        return len(self.keys) if self.kv_url else len(self.files)
 
     def __getitem__(self, idx):
-        d = np.load(self.files[idx])
-
-        left = d["left_rgb"]
-        right = d["right_rgb"]
-
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-        def norm(img):
-            rgb = img[:, :, ::-1].astype(np.float32) / 255.0
-            return torch.from_numpy((rgb - mean) / std).permute(2, 0, 1)
+        if self.kv_url:
+            left, right, K, depth_gt, seg_gt, occ_gt, bev_seg_gt = _load_npz_file(
+                self._client().get_npz(self.keys[idx])
+            )
+        else:
+            left, right, K, depth_gt, seg_gt, occ_gt, bev_seg_gt = _load_npz_file(
+                np.load(self.files[idx])
+            )
 
         return (
-            norm(left),                         # (3, H, W)
-            norm(right),                        # (3, H, W)
-            torch.from_numpy(d["K"]).float(),   # (3, 3)
-            torch.from_numpy(d["depth_gt"]).float(),  # (H, W)
-            torch.from_numpy(d["seg_gt"]).long(),      # (H, W) image-space
-            torch.from_numpy(d["occ_gt"]).float(),      # (bev_h, bev_w)
-            torch.from_numpy(d["bev_seg_gt"]).long(),   # (bev_h, bev_w) BEV per-cell class
+            _bgr_to_nchw_uint8(left),            # (3, H, W) uint8 RGB
+            _bgr_to_nchw_uint8(right),           # (3, H, W) uint8 RGB
+            torch.from_numpy(np.ascontiguousarray(K)).float(),
+            torch.from_numpy(np.ascontiguousarray(depth_gt)).float(),
+            torch.from_numpy(np.ascontiguousarray(seg_gt)).long(),
+            torch.from_numpy(np.ascontiguousarray(occ_gt)).float(),
+            torch.from_numpy(np.ascontiguousarray(bev_seg_gt)).long(),
         )
 
 
@@ -324,37 +393,45 @@ def log_3d_occupancy(writer, gt_occ, pred_occ, epoch, name="occupancy3d",
 #  Training loop
 # ════════════════════════════════════════════════════════════════
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, mean, std, use_amp=False, non_blocking=False):
     model.eval()
-    total = {"loss": 0, "seg": 0, "occ": 0, "bev_seg": 0}
+    totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg")}
     n = 0
+    amp_cm = torch.cuda.amp.autocast if use_amp else nullcontext
     with torch.no_grad():
         for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt in loader:
-            left_t, right_t, K_t = left_t.to(device), right_t.to(device), K_t.to(device)
-            seg_gt, occ_gt, bev_seg_gt = seg_gt.to(device), occ_gt.to(device), bev_seg_gt.to(device)
-            seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t)
-            losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
+            left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt = _move_batch(
+                left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt,
+                device, mean, std, non_blocking,
+            )
+            with amp_cm():
+                seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t)
+                losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
             bs = left_t.size(0)
-            total["loss"] += losses["loss"].item() * bs
-            total["seg"] += losses["seg_loss"].item() * bs
-            total["occ"] += losses["occ_loss"].item() * bs
-            total["bev_seg"] += losses["bev_seg_loss"].item() * bs
+            totals["loss"] += losses["loss"].detach() * bs
+            totals["seg"] += losses["seg_loss"].detach() * bs
+            totals["occ"] += losses["occ_loss"].detach() * bs
+            totals["bev_seg"] += losses["bev_seg_loss"].detach() * bs
             n += bs
-    return total["loss"]/n, total["seg"]/n, total["occ"]/n, total["bev_seg"]/n
+    return tuple((totals[k] / n).item() for k in ("loss", "seg", "occ", "bev_seg"))
 
 
-def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_samples=4):
+def log_visualizations(model, loader, writer, device, epoch, mean, std,
+                       bev_voxel=0.1, max_samples=4, use_amp=False, non_blocking=False):
     """Log comparison images + 3D occupancy to TensorBoard."""
     model.eval()
     count = 0
+    amp_cm = torch.cuda.amp.autocast if use_amp else nullcontext
 
     with torch.no_grad():
         for left_t, right_t, K_t, depth_gt_b, seg_gt_b, occ_gt_b, bev_seg_gt_b in loader:
-            left_t = left_t.to(device)
-            right_t = right_t.to(device)
-            K_t = K_t.to(device)
+            left_t, right_t, K_t, _, _, _ = _move_batch(
+                left_t, right_t, K_t, seg_gt_b, occ_gt_b, bev_seg_gt_b,
+                device, mean, std, non_blocking,
+            )
 
-            seg_logits, occ_logits, bev_seg_logits, depth_logits = model(left_t, right_t, K_t)
+            with amp_cm():
+                seg_logits, occ_logits, bev_seg_logits, depth_logits = model(left_t, right_t, K_t)
 
             B = left_t.size(0)
             for b in range(B):
@@ -369,7 +446,7 @@ def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_
                 # predicted depth (from model)
                 D = depth_logits.shape[1]
                 depth_bins = torch.linspace(1.0, 80.0, D).to(device)
-                depth_prob = torch.softmax(depth_logits[b:b+1], dim=1)
+                depth_prob = torch.softmax(depth_logits[b:b+1].float(), dim=1)
                 expected = (depth_prob * depth_bins.view(1, -1, 1, 1)).sum(dim=1)
                 pred_depth = torch.nn.functional.interpolate(
                     expected.unsqueeze(1), size=depth_gt_b.shape[1:],
@@ -384,9 +461,9 @@ def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_
 
                 # left RGB (denormalize)
                 left_np = left_t[b].cpu().permute(1, 2, 0).numpy()
-                mean = np.array([0.485, 0.456, 0.406])
-                std = np.array([0.229, 0.224, 0.225])
-                left_np = ((left_np * std + mean) * 255).clip(0, 255).astype(np.uint8)
+                mean_np = np.array(_IMAGENET_MEAN)
+                std_np = np.array(_IMAGENET_STD)
+                left_np = ((left_np * std_np + mean_np) * 255).clip(0, 255).astype(np.uint8)
                 left_np = cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR)
 
                 # 2D comparison panel
@@ -409,12 +486,20 @@ def log_visualizations(model, loader, writer, device, epoch, bev_voxel=0.1, max_
                 bev_seg_cmp = render_bev_seg_comparison(gt_bev_seg, pred_bev_seg, scale=3)
                 writer.add_image(f"bevseg/sample_{count}", bev_seg_cmp.transpose(2, 0, 1), epoch)
 
-                # 3D occupancy mesh
-                log_3d_occupancy(writer, gt_occ, pred_occ, epoch,
-                                  name=f"occupancy3d/sample_{count}",
-                                  voxel_size=bev_voxel)
-
                 count += 1
+
+
+def _dataloader_kwargs(batch_size, shuffle, workers, pin_memory):
+    kw = dict(
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    if workers > 0:
+        kw.update(persistent_workers=True, prefetch_factor=2)
+    return kw
 
 
 def train(
@@ -422,19 +507,44 @@ def train(
     checkpoint_path="stereo_bev_model.pth", log_dir="runs/bev_train",
     image_w=960, image_h=540,
     bev_range_xy=5.0, bev_z_range=5.0, bev_voxel=0.1, max_depth=80.0,
-    viz_every=5, resume=False,
+    viz_every=5, resume=False, kv_url=None,
+    workers=4, amp=True, device=None,
 ):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[Train] Device: {device}")
+    if device is None or device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
 
-    train_dataset = StereoBEVDataset(os.path.join(data_dir, "train"))
-    val_dataset = StereoBEVDataset(os.path.join(data_dir, "val"))
+    use_cuda = device.type == "cuda"
+    use_amp = bool(amp) and use_cuda
+    non_blocking = use_cuda
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"[Train] Device: cuda ({gpu_name})")
+    else:
+        print("[Train] Device: cpu  (CUDA not available)")
+
+    if kv_url:
+        train_dataset = StereoBEVDataset(kv_url=kv_url, kv_prefix="/train/")
+        val_dataset = StereoBEVDataset(kv_url=kv_url, kv_prefix="/val/")
+        print(f"[Train] KV mode: {kv_url}")
+    else:
+        train_dataset = StereoBEVDataset(data_dir=os.path.join(data_dir, "train"))
+        val_dataset = StereoBEVDataset(data_dir=os.path.join(data_dir, "val"))
     print(f"[Train] Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    print(f"[Train] DataLoader workers={workers}  amp={use_amp}  pin_memory={use_cuda}")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                               num_workers=0, pin_memory=(device == "cuda"))
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                             num_workers=0, pin_memory=(device == "cuda"))
+    train_loader = DataLoader(
+        train_dataset, **_dataloader_kwargs(batch_size, True, workers, use_cuda),
+    )
+    val_loader = DataLoader(
+        val_dataset, **_dataloader_kwargs(batch_size, False, workers, use_cuda),
+    )
 
     model = StereoBEVModel(
         num_classes=NUM_BEV_CLASSES, image_h=image_h, image_w=image_w,
@@ -449,6 +559,9 @@ def train(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    mean, std = _norm_bufs(device)
+    amp_cm = torch.cuda.amp.autocast if use_amp else nullcontext
 
     start_epoch = 0
     if resume and os.path.isfile(checkpoint_path):
@@ -457,6 +570,8 @@ def train(
             model.load_state_dict(ckpt["model"])
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
+            if ckpt.get("scaler") is not None and use_amp:
+                scaler.load_state_dict(ckpt["scaler"])
             start_epoch = ckpt["epoch"] + 1
             print(f"[Train] Resumed at epoch {start_epoch}")
         else:
@@ -468,34 +583,39 @@ def train(
     print(f"[Train] Training for {epochs} epochs...")
     for epoch in range(start_epoch, epochs):
         model.train()
-        total = {"loss": 0, "seg": 0, "occ": 0, "bev_seg": 0}
+        totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg")}
         n = 0
 
         for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt in train_loader:
-            left_t, right_t, K_t = left_t.to(device), right_t.to(device), K_t.to(device)
-            seg_gt, occ_gt, bev_seg_gt = seg_gt.to(device), occ_gt.to(device), bev_seg_gt.to(device)
+            left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt = _move_batch(
+                left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt,
+                device, mean, std, non_blocking,
+            )
 
-            seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t)
-            losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
-
-            optimizer.zero_grad()
-            losses["loss"].backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with amp_cm():
+                seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t)
+                losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
+            scaler.scale(losses["loss"]).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             bs = left_t.size(0)
-            total["loss"] += losses["loss"].item() * bs
-            total["seg"] += losses["seg_loss"].item() * bs
-            total["occ"] += losses["occ_loss"].item() * bs
-            total["bev_seg"] += losses["bev_seg_loss"].item() * bs
+            totals["loss"] += losses["loss"].detach() * bs
+            totals["seg"] += losses["seg_loss"].detach() * bs
+            totals["occ"] += losses["occ_loss"].detach() * bs
+            totals["bev_seg"] += losses["bev_seg_loss"].detach() * bs
             n += bs
 
         scheduler.step()
-        train_loss = total["loss"] / n
-        train_seg = total["seg"] / n
-        train_occ = total["occ"] / n
-        train_bev_seg = total["bev_seg"] / n
+        train_loss = (totals["loss"] / n).item()
+        train_seg = (totals["seg"] / n).item()
+        train_occ = (totals["occ"] / n).item()
+        train_bev_seg = (totals["bev_seg"] / n).item()
 
-        val_loss, val_seg, val_occ, val_bev_seg = evaluate(model, val_loader, device)
+        val_loss, val_seg, val_occ, val_bev_seg = evaluate(
+            model, val_loader, device, mean, std, use_amp=use_amp, non_blocking=non_blocking,
+        )
 
         # save checkpoint
         torch.save({
@@ -503,6 +623,7 @@ def train(
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict() if use_amp else None,
         }, checkpoint_path)
 
         # tensorboard
@@ -514,7 +635,13 @@ def train(
         writer.add_scalar("lr", lr_now, epoch)
 
         if epoch % viz_every == 0 or epoch == epochs - 1:
-            log_visualizations(model, val_loader, writer, device, epoch, bev_voxel=bev_voxel)
+            try:
+                log_visualizations(
+                    model, val_loader, writer, device, epoch, mean, std,
+                    bev_voxel=bev_voxel, use_amp=use_amp, non_blocking=non_blocking,
+                )
+            except Exception as e:
+                print(f"[Train] viz skipped: {e}", flush=True)
 
         if (epoch + 1) % 5 == 0 or epoch == start_epoch:
             print(f"  epoch {epoch+1:3d}/{epochs}  "
@@ -540,9 +667,16 @@ if __name__ == "__main__":
     parser.add_argument("--bev-range", type=float, default=5.0)
     parser.add_argument("--bev-voxel", type=float, default=0.1)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--kv-url", default=None, help="minikeyvalue URL (e.g. http://localhost:3000)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="DataLoader workers (0 = load on the training process)")
+    parser.add_argument("--no-amp", action="store_true", help="Disable CUDA mixed precision")
+    parser.add_argument("--device", default="auto", choices=("auto", "cuda", "cpu"))
     args = parser.parse_args()
 
     train(data_dir=args.data, epochs=args.epochs, batch_size=args.batch_size,
           lr=args.lr, checkpoint_path=args.output, log_dir=args.logdir,
           viz_every=args.viz_every, image_w=args.image_w, image_h=args.image_h,
-          bev_range_xy=args.bev_range, bev_voxel=args.bev_voxel, resume=args.resume)
+          bev_range_xy=args.bev_range, bev_voxel=args.bev_voxel, resume=args.resume,
+          kv_url=args.kv_url, workers=args.workers, amp=not args.no_amp,
+          device=args.device)

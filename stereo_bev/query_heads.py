@@ -200,6 +200,11 @@ if HAS_TORCH:
             B, C, Hf, Wf = img_feat.shape
             D = self.depth_bins
             device = img_feat.device
+            out_dtype = img_feat.dtype
+            # Geometry + scatter in fp32 even under AMP (stable voxel pooling).
+            img_feat = img_feat.float()
+            depth_logits = depth_logits.float()
+            K = K.float()
 
             depth_prob = F.softmax(depth_logits, dim=1)
             img_feat_exp = img_feat.unsqueeze(2)
@@ -233,16 +238,15 @@ if HAS_TORCH:
 
             valid = (gi >= 0) & (gi < self.bev_w) & (gj >= 0) & (gj < self.bev_h) & (gk >= 0) & (gk < z_cells)
 
-            bev_feat = torch.zeros(B, C, self.bev_h, self.bev_w, device=device)
-            for b in range(B):
-                vb = valid[b]
-                if vb.sum() == 0: continue
-                feat_vals = frustum_feat[b][:, vb]
-                lin_idx = (gj[b][vb] * self.bev_w + gi[b][vb])
-                bev_flat = torch.zeros(C, self.bev_h * self.bev_w, device=device)
-                bev_flat.scatter_add_(1, lin_idx.unsqueeze(0).expand(C, -1), feat_vals)
-                bev_feat[b] = bev_flat.view(C, self.bev_h, self.bev_w)
-            return bev_feat
+            # Vectorized splat: avoid per-sample boolean indexing and
+            # `if vb.sum() == 0`, both of which sync the GPU back to the CPU.
+            n = D * Hf * Wf
+            bev_n = self.bev_h * self.bev_w
+            feat_flat = frustum_feat.reshape(B, C, n) * valid.reshape(B, 1, n).to(frustum_feat.dtype)
+            lin_idx = (gj.reshape(B, n) * self.bev_w + gi.reshape(B, n)).clamp(0, bev_n - 1)
+            bev_flat = frustum_feat.new_zeros(B, C, bev_n)
+            bev_flat.scatter_add_(2, lin_idx.unsqueeze(1).expand(B, C, n), feat_flat)
+            return bev_flat.view(B, C, self.bev_h, self.bev_w).to(out_dtype)
 
     # ── BEV Encoder ──
 
@@ -350,7 +354,7 @@ if HAS_TORCH:
 
             return seg_logits, occ_logits, bev_seg_logits, depth_logits
 
-        def infer(self, left_rgb, right_rgb, K, device="cpu"):
+        def infer(self, left_rgb, right_rgb, K, device=None):
             """
             Inference from numpy arrays.
 
@@ -360,6 +364,8 @@ if HAS_TORCH:
                 bev_seg_classes: (bev_h, bev_w) uint8 per-cell BEV class
                 depth_map:       (H, W) float32 meters
             """
+            if device is None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
             mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
