@@ -4,7 +4,7 @@ Training script for StereoBEVModel with image-space segmentation.
 The model predicts:
   - Per-pixel semantic segmentation in IMAGE SPACE (camera view)
   - Per-pixel depth from stereo
-  - 3D occupancy volume (lifted from depth + seg)
+  - 3D occupancy volume (lifted from depth + seg); occupancy is evaluated with IoU
 
 Usage:
     python train_bev.py --kv-url http://localhost:3000 --epochs 50 --batch-size 2
@@ -28,7 +28,10 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 from stereo_bev.segmentation import NUM_BEV_CLASSES, BEV_CLASSES, BEV_COLORS
-from stereo_bev.query_heads import StereoBEVModel, stereo_bev_loss, GeometricOccHead
+from stereo_bev.query_heads import (
+    StereoBEVModel, stereo_bev_loss, GeometricOccHead,
+    occupancy_iou_counts, occupancy_iou_from_counts,
+)
 from stereo_bev.bev_grid import (
     BEVGrid, occupancy_to_bev,
     DEFAULT_X_RANGE, DEFAULT_Y_RANGE, DEFAULT_Z_RANGE, DEFAULT_VOXEL,
@@ -423,9 +426,24 @@ def log_3d_occupancy(writer, gt_occ, pred_occ, epoch, name="occupancy3d",
 #  Training loop
 # ════════════════════════════════════════════════════════════════
 
+def _accumulate_occ_iou(iou_counts, occ_logits, occ_gt):
+    inter, union, inter_bev, union_bev = occupancy_iou_counts(occ_logits, occ_gt)
+    iou_counts["inter"] += inter
+    iou_counts["union"] += union
+    iou_counts["inter_bev"] += inter_bev
+    iou_counts["union_bev"] += union_bev
+
+
+def _iou_counts(device):
+    z = torch.zeros((), device=device, dtype=torch.long)
+    return {"inter": z.clone(), "union": z.clone(), "inter_bev": z.clone(), "union_bev": z.clone()}
+
+
 def evaluate(model, loader, device, mean, std, use_amp=False, non_blocking=False):
+    """Return mean losses plus dataset-level occupancy IoU (voxel 3D and BEV)."""
     model.eval()
     totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg")}
+    iou_counts = _iou_counts(device)
     n = 0
     amp_cm = torch.cuda.amp.autocast if use_amp else nullcontext
     with torch.no_grad():
@@ -437,13 +455,21 @@ def evaluate(model, loader, device, mean, std, use_amp=False, non_blocking=False
             with amp_cm():
                 seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t, cam_ext)
                 losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
+            _accumulate_occ_iou(iou_counts, occ_logits, occ_gt)
             bs = left_t.size(0)
             totals["loss"] += losses["loss"].detach() * bs
             totals["seg"] += losses["seg_loss"].detach() * bs
             totals["occ"] += losses["occ_loss"].detach() * bs
             totals["bev_seg"] += losses["bev_seg_loss"].detach() * bs
             n += bs
-    return tuple((totals[k] / n).item() for k in ("loss", "seg", "occ", "bev_seg"))
+    return {
+        "loss": (totals["loss"] / n).item(),
+        "seg": (totals["seg"] / n).item(),
+        "occ": (totals["occ"] / n).item(),
+        "bev_seg": (totals["bev_seg"] / n).item(),
+        "occ_iou": occupancy_iou_from_counts(iou_counts["inter"], iou_counts["union"]),
+        "occ_bev_iou": occupancy_iou_from_counts(iou_counts["inter_bev"], iou_counts["union_bev"]),
+    }
 
 
 def log_visualizations(model, loader, writer, device, epoch, mean, std,
@@ -633,6 +659,7 @@ def train(
     for epoch in range(start_epoch, epochs):
         model.train()
         totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg")}
+        iou_counts = _iou_counts(device)
         n = 0
 
         for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt, cam_ext in train_loader:
@@ -649,6 +676,9 @@ def train(
             scaler.step(optimizer)
             scaler.update()
 
+            with torch.no_grad():
+                _accumulate_occ_iou(iou_counts, occ_logits, occ_gt)
+
             bs = left_t.size(0)
             totals["loss"] += losses["loss"].detach() * bs
             totals["seg"] += losses["seg_loss"].detach() * bs
@@ -661,10 +691,14 @@ def train(
         train_seg = (totals["seg"] / n).item()
         train_occ = (totals["occ"] / n).item()
         train_bev_seg = (totals["bev_seg"] / n).item()
+        train_occ_iou = occupancy_iou_from_counts(iou_counts["inter"], iou_counts["union"])
+        train_occ_bev_iou = occupancy_iou_from_counts(iou_counts["inter_bev"], iou_counts["union_bev"])
 
-        val_loss, val_seg, val_occ, val_bev_seg = evaluate(
+        val = evaluate(
             model, val_loader, device, mean, std, use_amp=use_amp, non_blocking=non_blocking,
         )
+        val_loss, val_seg, val_occ, val_bev_seg = val["loss"], val["seg"], val["occ"], val["bev_seg"]
+        val_occ_iou, val_occ_bev_iou = val["occ_iou"], val["occ_bev_iou"]
 
         # save checkpoint
         torch.save({
@@ -680,6 +714,8 @@ def train(
         writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch)
         writer.add_scalars("seg_loss", {"train": train_seg, "val": val_seg}, epoch)
         writer.add_scalars("occ_loss", {"train": train_occ, "val": val_occ}, epoch)
+        writer.add_scalars("occ_iou", {"train": train_occ_iou, "val": val_occ_iou}, epoch)
+        writer.add_scalars("occ_bev_iou", {"train": train_occ_bev_iou, "val": val_occ_bev_iou}, epoch)
         writer.add_scalars("bev_seg_loss", {"train": train_bev_seg, "val": val_bev_seg}, epoch)
         writer.add_scalar("lr", lr_now, epoch)
 
@@ -694,8 +730,10 @@ def train(
 
         if (epoch + 1) % 5 == 0 or epoch == start_epoch:
             print(f"  epoch {epoch+1:3d}/{epochs}  "
-                  f"train: loss={train_loss:.4f} seg={train_seg:.4f} occ={train_occ:.4f} bev_seg={train_bev_seg:.4f}  "
-                  f"val: loss={val_loss:.4f} seg={val_seg:.4f} occ={val_occ:.4f} bev_seg={val_bev_seg:.4f}  "
+                  f"train: loss={train_loss:.4f} seg={train_seg:.4f} occ={train_occ:.4f} "
+                  f"occ_iou={train_occ_iou:.4f} bev_iou={train_occ_bev_iou:.4f} bev_seg={train_bev_seg:.4f}  "
+                  f"val: loss={val_loss:.4f} seg={val_seg:.4f} occ={val_occ:.4f} "
+                  f"occ_iou={val_occ_iou:.4f} bev_iou={val_occ_bev_iou:.4f} bev_seg={val_bev_seg:.4f}  "
                   f"lr={lr_now:.6f}", flush=True)
 
     writer.close()

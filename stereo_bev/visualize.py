@@ -135,3 +135,122 @@ def draw_occ_3d_projections(
     )
     row = np.concatenate([pad_h(xy), pad_h(xz), pad_h(yz)], axis=1)
     return np.concatenate([banner, row], axis=0)
+
+
+def ego_to_bev_px(x, y, grid, scale: int) -> tuple[int, int]:
+    """Map ego XY to pixel (col, row) on a scaled BEV image of shape (Y, X)."""
+    col = int(((x - grid.x_range[0]) / grid.voxel_size) * scale + 0.5 * scale)
+    row = int(((y - grid.y_range[0]) / grid.voxel_size) * scale + 0.5 * scale)
+    return col, row
+
+
+def ego_to_occ_xy_px(x, y, grid, scale: int) -> tuple[int, int]:
+    """
+    Map ego XY to pixels on the occupancy XY panel after rot90+fliplr
+    (same transform as draw_occ_3d_projections: +X up, +Y left).
+    """
+    xi = (x - grid.x_range[0]) / grid.voxel_size
+    yi = (y - grid.y_range[0]) / grid.voxel_size
+    nx, ny = grid.grid_w, grid.grid_h
+    row = int((nx - 1 - xi) * scale)
+    col = int((ny - 1 - yi) * scale)
+    return col, row
+
+
+def _polyline(img, pts_px, color, thickness=2):
+    if len(pts_px) < 2:
+        return
+    arr = np.array(pts_px, dtype=np.int32).reshape(-1, 1, 2)
+    cv2.polylines(img, [arr], False, color, thickness, cv2.LINE_AA)
+
+
+def draw_planning_on_bev(
+    bev_img: np.ndarray,
+    grid,
+    scale: int,
+    traj_xy: np.ndarray | None = None,
+    route_xy: np.ndarray | None = None,
+    target_xy: np.ndarray | None = None,
+) -> np.ndarray:
+    """Overlay route (cyan), NMPC traj (yellow), 5 s target (red), ego (white)."""
+    out = bev_img.copy()
+    h, w = out.shape[:2]
+
+    def clip_pts(xy):
+        px = []
+        for x, y in xy:
+            c, r = ego_to_bev_px(float(x), float(y), grid, scale)
+            if -8 <= c < w + 8 and -8 <= r < h + 8:
+                px.append((int(np.clip(c, 0, w - 1)), int(np.clip(r, 0, h - 1))))
+        return px
+
+    if route_xy is not None and len(route_xy):
+        _polyline(out, clip_pts(route_xy), (255, 220, 0), 1)
+    if traj_xy is not None and len(traj_xy):
+        _polyline(out, clip_pts(traj_xy), (0, 255, 255), 2)
+    if target_xy is not None:
+        c, r = ego_to_bev_px(float(target_xy[0]), float(target_xy[1]), grid, scale)
+        if 0 <= c < w and 0 <= r < h:
+            cv2.drawMarker(out, (c, r), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 14, 2)
+    ego = ego_to_bev_px(0.0, 0.0, grid, scale)
+    cv2.drawMarker(out, (int(np.clip(ego[0], 0, w - 1)), int(np.clip(ego[1], 0, h - 1))),
+                   (255, 255, 255), cv2.MARKER_CROSS, 12, 1)
+    return out
+
+
+def draw_occ_3d_with_sweep(
+    occ: np.ndarray,
+    sweep: np.ndarray | None = None,
+    traj_xy: np.ndarray | None = None,
+    route_xy: np.ndarray | None = None,
+    target_xy: np.ndarray | None = None,
+    grid=None,
+    scale: int = 3,
+    x_range: tuple[float, float] = (0.0, 20.0),
+    y_range: tuple[float, float] = (-10.0, 10.0),
+    z_range: tuple[float, float] = (-1.0, 3.0),
+) -> np.ndarray:
+    """3D occupancy projections with optional body-sweep tint and path overlay."""
+    occ_u8 = (np.asarray(occ) > 0).astype(np.uint8)
+    panel = draw_occ_3d_projections(
+        occ_u8, scale=scale, x_range=x_range, y_range=y_range, z_range=z_range,
+    )
+    if grid is None:
+        return panel
+
+    banner_h = 22
+    xy_w = grid.grid_h * scale  # after rot90+fliplr, width is ny * scale
+    xy_h = grid.grid_w * scale
+    roi = panel[banner_h:banner_h + xy_h, :xy_w]
+    if roi.size == 0:
+        return panel
+
+    if sweep is not None:
+        sw = np.asarray(sweep).astype(bool)
+        if sw.any():
+            # project sweep to XY then apply the same rot90+fliplr
+            hit = sw.any(axis=0).astype(np.uint8)  # (Y, X)
+            hit = np.fliplr(np.rot90(hit, k=1))
+            hit = _scale_nearest(hit, scale)
+            h = min(hit.shape[0], roi.shape[0])
+            w = min(hit.shape[1], roi.shape[1])
+            mask = hit[:h, :w] > 0
+            roi[:h, :w][mask] = (0, 180, 255)
+
+    def clip_occ(xy):
+        pts = []
+        for x, y in xy:
+            c, r = ego_to_occ_xy_px(float(x), float(y), grid, scale)
+            if 0 <= c < roi.shape[1] and 0 <= r < roi.shape[0]:
+                pts.append((c, r))
+        return pts
+
+    if route_xy is not None and len(route_xy):
+        _polyline(roi, clip_occ(route_xy), (255, 220, 0), 1)
+    if traj_xy is not None and len(traj_xy):
+        _polyline(roi, clip_occ(traj_xy), (0, 255, 255), 2)
+    if target_xy is not None:
+        c, r = ego_to_occ_xy_px(float(target_xy[0]), float(target_xy[1]), grid, scale)
+        if 0 <= c < roi.shape[1] and 0 <= r < roi.shape[0]:
+            cv2.drawMarker(roi, (c, r), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 12, 2)
+    return panel

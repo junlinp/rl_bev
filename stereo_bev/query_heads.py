@@ -458,3 +458,39 @@ if HAS_TORCH:
             "occ_loss": occ_loss,
             "bev_seg_loss": bev_seg_loss,
         }
+
+
+    def occupancy_iou_counts(occ_logits, occ_gt, threshold: float = 0.5):
+        """
+        Occupancy IoU counts for a batch.
+
+        occ_logits: (B, Z, H, W) or (B, H, W)
+        occ_gt:     same shape, {0,1}
+
+        Returns (inter_3d, union_3d, inter_bev, union_bev) as scalar long tensors.
+        BEV IoU collapses occupied voxels over Z (max-over-height).
+        """
+        pred = occ_logits.detach().float().sigmoid() >= threshold
+        gt = occ_gt.detach() > 0.5
+        if pred.shape != gt.shape:
+            raise ValueError(f"occ pred/gt shape mismatch: {tuple(pred.shape)} vs {tuple(gt.shape)}")
+
+        inter = (pred & gt).sum()
+        union = (pred | gt).sum()
+        if pred.dim() == 4:
+            pred_bev = pred.any(dim=1)
+            gt_bev = gt.any(dim=1)
+            inter_bev = (pred_bev & gt_bev).sum()
+            union_bev = (pred_bev | gt_bev).sum()
+        else:
+            inter_bev, union_bev = inter, union
+        return inter, union, inter_bev, union_bev
+
+
+    def occupancy_iou_from_counts(inter, union) -> float:
+        """IoU from accumulated intersection/union. Both-empty → 1.0."""
+        inter = float(inter)
+        union = float(union)
+        if union <= 0.0:
+            return 1.0
+        return inter / union
