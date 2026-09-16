@@ -23,6 +23,8 @@ try:
         StereoBEVModel,
         OccQueryHead,
         stereo_bev_loss,
+        occupancy_iou_counts,
+        occupancy_iou_from_counts,
     )
 except ImportError:
     pass
