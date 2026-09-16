@@ -22,8 +22,12 @@ sys.path.insert(0, os.path.dirname(__file__))
 from stereo_bev.camera_rig import CameraRig
 from stereo_bev.depth import decode_carla_depth
 from stereo_bev.segmentation import remap_segmentation, NUM_BEV_CLASSES, BEV_CLASSES
-from stereo_bev.bev_grid import BEVGrid
+from stereo_bev.bev_grid import (
+    BEVGrid, occupancy_to_bev,
+    DEFAULT_X_RANGE, DEFAULT_Y_RANGE, DEFAULT_Z_RANGE, DEFAULT_VOXEL,
+)
 from stereo_bev.query_heads import GeometricSegHead, GeometricOccHead
+from stereo_bev.calibration import DEFAULT_PITCH_DEG
 from minikeyvalue_client import MiniKV
 
 
@@ -109,10 +113,12 @@ def collect(
     fov: float = 90.0,
     baseline: float = 0.12,
     fps: float = 10.0,
-    bev_range_xy: float = 5.0,
-    bev_z_range: float = 5.0,
-    bev_voxel: float = 0.1,
+    bev_x_range: tuple[float, float] = DEFAULT_X_RANGE,
+    bev_y_range: tuple[float, float] = DEFAULT_Y_RANGE,
+    bev_z_range: tuple[float, float] = DEFAULT_Z_RANGE,
+    bev_voxel: float = DEFAULT_VOXEL,
     max_depth: float = 80.0,
+    pitch_deg: float = DEFAULT_PITCH_DEG,
     steps_per_sample: int = 3,
     num_vehicles: int = 15,
     num_walkers: int = 10,
@@ -180,22 +186,19 @@ def collect(
     npcs = spawn_npc_traffic(world, tm, vehicle, num_vehicles, num_walkers)
 
     # ── rig + BEV ──
-    rig = CameraRig(vehicle, world, image_w, image_h, fov, fps, baseline)
+    rig = CameraRig(vehicle, world, image_w, image_h, fov, fps, baseline, pitch_deg=pitch_deg)
     bev = BEVGrid(
-        x_range=(-bev_range_xy, bev_range_xy),
-        y_range=(-bev_range_xy, bev_range_xy),
-        z_range=(0.0, bev_z_range),
+        x_range=bev_x_range,
+        y_range=bev_y_range,
+        z_range=bev_z_range,
         voxel_size=bev_voxel,
         num_classes=NUM_BEV_CLASSES,
     )
     seg_head = GeometricSegHead()
     occ_head = GeometricOccHead(min_hits=2.0)
-    cam_ext = np.array([
-        [ 0,  0,  1,  1.5],
-        [-1,  0,  0,  0.0],
-        [ 0, -1,  0,  1.6],
-        [ 0,  0,  0,  1.0],
-    ], dtype=np.float64)
+    cam_ext = rig.cam_extrinsic
+    print(f"[Collect] Occupancy volume: {bev.grid_z}x{bev.grid_h}x{bev.grid_w}  "
+          f"voxel={bev_voxel}m  pitch={pitch_deg}°")
 
     # warm up
     print("[Collect] Warming up...", flush=True)
@@ -224,11 +227,11 @@ def collect(
             result = bev.bev_from_frame(depth, seg_image, rig.K, cam_ext, max_depth=max_depth)
 
             seg_gt = seg_image   # IMAGE-SPACE segmentation (camera view)
-            occ_gt = occ_head(result["occupancy_count"])  # BEV occupancy grid
-            bev_seg_gt = bev.get_bev_semantic(result["class_histogram"])  # BEV per-cell class
+            occ_gt = occ_head(result["occupancy_count"])  # (Z, H, W) 3D occupancy
+            bev_seg_gt = bev.get_bev_semantic(result["class_histogram"])
+            occ_bev = occupancy_to_bev(occ_gt)
 
-            # ── quality filter ──
-            n_occupied = occ_gt.sum()
+            n_occupied = int(occ_gt.sum())
             n_classes = len(np.unique(seg_gt))
 
             if n_occupied < min_occupied or n_classes < min_classes:
@@ -257,6 +260,11 @@ def collect(
                     occ_gt=occ_gt,
                     bev_seg_gt=bev_seg_gt,
                     K=rig.K,
+                    cam_ext=cam_ext,
+                    x_range=np.array(bev_x_range, dtype=np.float32),
+                    y_range=np.array(bev_y_range, dtype=np.float32),
+                    z_range=np.array(bev_z_range, dtype=np.float32),
+                    voxel_size=np.float32(bev_voxel),
                 )
                 kv.put(key, buf.getvalue())
             else:
@@ -274,18 +282,24 @@ def collect(
                     occ_gt=occ_gt,
                     bev_seg_gt=bev_seg_gt,
                     K=rig.K,
+                    cam_ext=cam_ext,
+                    x_range=np.array(bev_x_range, dtype=np.float32),
+                    y_range=np.array(bev_y_range, dtype=np.float32),
+                    z_range=np.array(bev_z_range, dtype=np.float32),
+                    voxel_size=np.float32(bev_voxel),
                 )
 
             collected += 1
             split = "train" if collected <= num_train else "val"
             if collected % 25 == 0 or collected == num_samples:
                 loc = vehicle.get_location()
-                occupied_classes = np.unique(bev_seg_gt[occ_gt > 0]) if n_occupied else []
+                occupied_classes = np.unique(bev_seg_gt[occ_bev > 0]) if n_occupied else []
                 class_names = [BEV_CLASSES.get(int(c), str(c)) for c in occupied_classes]
+                z_hit = int((occ_gt.reshape(occ_gt.shape[0], -1).sum(axis=1) > 0).sum())
                 print(
                     f"  [{split}] {collected}/{num_samples}  "
                     f"pos=({loc.x:.0f},{loc.y:.0f})  "
-                    f"occ={n_occupied}/{occ_gt.size}  "
+                    f"occ={n_occupied}/{occ_gt.size}  z_bins={z_hit}/{occ_gt.shape[0]}  "
                     f"classes={class_names}  "
                     f"skipped={skipped}",
                     flush=True,

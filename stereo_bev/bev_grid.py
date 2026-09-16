@@ -1,6 +1,19 @@
-"""BEV grid: lift depth + segmentation into a voxel grid, then collapse to BEV."""
+"""BEV grid: lift depth + segmentation into a 3D voxel occupancy volume."""
 
 import numpy as np
+
+# Local 3D occupancy volume (ego frame: X forward, Y left, Z up)
+DEFAULT_X_RANGE = (0.0, 20.0)
+DEFAULT_Y_RANGE = (-10.0, 10.0)
+DEFAULT_Z_RANGE = (-1.0, 3.0)
+DEFAULT_VOXEL = 0.2
+
+
+def occupancy_to_bev(occ: np.ndarray) -> np.ndarray:
+    """(Z, H, W) or (H, W) occupancy → (H, W) binary bird's-eye mask."""
+    if occ.ndim == 3:
+        return (occ.max(axis=0) > 0).astype(np.uint8)
+    return (occ > 0).astype(np.uint8)
 
 
 class BEVGrid:
@@ -19,10 +32,10 @@ class BEVGrid:
 
     def __init__(
         self,
-        x_range: tuple[float, float] = (-50.0, 50.0),
-        y_range: tuple[float, float] = (-50.0, 50.0),
-        z_range: tuple[float, float] = (-3.0, 5.0),
-        voxel_size: float = 0.5,
+        x_range: tuple[float, float] = DEFAULT_X_RANGE,
+        y_range: tuple[float, float] = DEFAULT_Y_RANGE,
+        z_range: tuple[float, float] = DEFAULT_Z_RANGE,
+        voxel_size: float = DEFAULT_VOXEL,
         num_classes: int = 10,
     ):
         self.x_range = x_range
@@ -140,7 +153,7 @@ class BEVGrid:
         """
         from .depth import depth_to_pointcloud
 
-        points_cam, _ = depth_to_pointcloud(depth_map, K, max_depth=max_depth)
+        points_cam, pixels = depth_to_pointcloud(depth_map, K, max_depth=max_depth)
         if points_cam.shape[0] == 0:
             return {
                 "occupancy_count": np.zeros((self.grid_z, self.grid_h, self.grid_w), dtype=np.float32),
@@ -148,15 +161,22 @@ class BEVGrid:
             }
 
         points_ego = self.camera_to_ego(points_cam, cam_extrinsic)
-
-        # extract class labels at valid pixels
-        h, w = depth_map.shape
-        valid_mask = (depth_map > 0) & (depth_map < max_depth)
-        labels = seg_map[valid_mask]
+        v = pixels[:, 1].astype(np.int32)
+        u = pixels[:, 0].astype(np.int32)
+        labels = seg_map[v, u]
 
         return self.voxelize(points_ego, class_labels=labels)
 
     # ── BEV map queries ──
+
+    @staticmethod
+    def get_occupancy_3d(occ_count: np.ndarray, threshold: float = 2.0) -> np.ndarray:
+        """
+        Threshold the 3D hit-count volume.
+
+        Returns (grid_z, grid_h, grid_w) uint8 binary occupancy.
+        """
+        return (occ_count >= threshold).astype(np.uint8)
 
     @staticmethod
     def get_occupancy_map(occ_count: np.ndarray, threshold: float = 1.0) -> np.ndarray:
@@ -165,9 +185,7 @@ class BEVGrid:
 
         Returns (grid_h, grid_w) binary: 1 if any voxel above threshold is hit.
         """
-        # sum along Z axis
-        projected = occ_count.sum(axis=0)
-        return (projected >= threshold).astype(np.uint8)
+        return occupancy_to_bev((occ_count >= threshold).astype(np.uint8))
 
     @staticmethod
     def get_bev_semantic(class_histogram: np.ndarray) -> np.ndarray:

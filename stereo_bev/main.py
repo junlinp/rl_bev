@@ -8,9 +8,10 @@ import time
 from .camera_rig import CameraRig
 from .depth import decode_carla_depth
 from .segmentation import remap_segmentation
-from .bev_grid import BEVGrid
+from .bev_grid import BEVGrid, occupancy_to_bev, DEFAULT_X_RANGE, DEFAULT_Y_RANGE, DEFAULT_Z_RANGE, DEFAULT_VOXEL
 from .query_heads import GeometricOccHead, HAS_TORCH
-from .visualize import draw_bev_map, draw_legend, draw_depth_heatmap
+from .visualize import draw_bev_map, draw_legend, draw_depth_heatmap, draw_occ_3d_projections
+from .calibration import DEFAULT_PITCH_DEG
 
 
 def run(
@@ -22,10 +23,12 @@ def run(
     fov: float = 90.0,
     baseline: float = 0.12,
     fps: float = 15.0,
-    bev_range_xy: float = 5.0,
-    bev_z_range: float = 5.0,
-    bev_voxel: float = 0.1,
+    bev_x_range: tuple[float, float] = DEFAULT_X_RANGE,
+    bev_y_range: tuple[float, float] = DEFAULT_Y_RANGE,
+    bev_z_range: tuple[float, float] = DEFAULT_Z_RANGE,
+    bev_voxel: float = DEFAULT_VOXEL,
     max_depth: float = 80.0,
+    pitch_deg: float = DEFAULT_PITCH_DEG,
     mode: str = "geometric",     # "geometric" or "model"
     model_checkpoint: str | None = None,
 ):
@@ -59,14 +62,13 @@ def run(
     vehicle.set_autopilot(True, tm.get_port())
 
     # ── camera rig ──
-    rig = CameraRig(vehicle, world, image_w, image_h, fov, fps, baseline)
+    rig = CameraRig(vehicle, world, image_w, image_h, fov, fps, baseline, pitch_deg=pitch_deg)
 
-    # ── BEV grid (used for geometric mode + GT generation) ──
     from .segmentation import NUM_BEV_CLASSES
     bev = BEVGrid(
-        x_range=(-bev_range_xy, bev_range_xy),
-        y_range=(-bev_range_xy, bev_range_xy),
-        z_range=(0.0, bev_z_range),
+        x_range=bev_x_range,
+        y_range=bev_y_range,
+        z_range=bev_z_range,
         voxel_size=bev_voxel,
         num_classes=NUM_BEV_CLASSES,
     )
@@ -86,12 +88,14 @@ def run(
             num_classes=NUM_BEV_CLASSES,
             image_h=image_h,
             image_w=image_w,
-            bev_x_range=(-bev_range_xy, bev_range_xy),
-            bev_y_range=(-bev_range_xy, bev_range_xy),
-            bev_z_range=(0.0, bev_z_range),
+            bev_x_range=bev_x_range,
+            bev_y_range=bev_y_range,
+            bev_z_range=bev_z_range,
             bev_voxel=bev_voxel,
             max_depth=max_depth,
             pretrained_backbone=False,
+            cam_extrinsic=rig.cam_extrinsic,
+            pitch_deg=pitch_deg,
         )
         model.load_state_dict(torch.load(model_checkpoint, map_location=device))
         model = model.to(device)
@@ -100,19 +104,10 @@ def run(
     else:
         occ_head_geo = GeometricOccHead(min_hits=2.0)
 
-    # Camera frame: X=right, Y=down, Z=forward
-    # Ego frame:    X=forward, Y=left, Z=up
-    # Rotation: ego_x=cam_z, ego_y=-cam_x, ego_z=-cam_y
-    # Translation: camera mount at (1.5, 0, 1.6) in ego frame
-    cam_extrinsic = np.array([
-        [ 0,  0,  1,  1.5],
-        [-1,  0,  0,  0.0],
-        [ 0, -1,  0,  1.6],
-        [ 0,  0,  0,  1.0],
-    ], dtype=np.float64)
+    cam_extrinsic = rig.cam_extrinsic
 
     print(f"[BEV] Mode: {mode}")
-    print(f"[BEV] Grid: {bev.grid_w}x{bev.grid_h}x{bev.grid_z} voxels, voxel={bev_voxel}m")
+    print(f"[BEV] Occupancy: {bev.grid_z}x{bev.grid_h}x{bev.grid_w} voxels, voxel={bev_voxel}m, pitch={pitch_deg}°")
     print(f"[BEV] Camera: {image_w}x{image_h}, fov={fov}°, baseline={baseline}m")
     print(f"[BEV] Press 'q' to quit")
 
@@ -134,7 +129,7 @@ def run(
             if model is not None:
                 # model mode: stereo RGB → BEV
                 _, occ_map, bev_classes, _ = model.infer(
-                    left_rgb, right_rgb, rig.K, device=device,
+                    left_rgb, right_rgb, rig.K, device=device, cam_ext=cam_extrinsic,
                 )
                 # decode depth for visualization only
                 depth = decode_carla_depth(data["depth_raw"])
@@ -177,16 +172,31 @@ def run(
             else:
                 top_row = np.concatenate([left_small, depth_small], axis=1)
 
+            occ_panel = draw_occ_3d_projections(
+                occ_map, scale=3,
+                x_range=bev.x_range, y_range=bev.y_range, z_range=bev.z_range,
+            )
+
             canvas = np.concatenate([top_row, bev_img], axis=0)
+            # match occupancy panel width
+            if occ_panel.shape[1] < canvas.shape[1]:
+                pad = np.zeros((occ_panel.shape[0], canvas.shape[1] - occ_panel.shape[1], 3), dtype=np.uint8)
+                occ_panel = np.concatenate([occ_panel, pad], axis=1)
+            elif occ_panel.shape[1] > canvas.shape[1]:
+                occ_panel = occ_panel[:, :canvas.shape[1]]
+            canvas = np.concatenate([canvas, occ_panel], axis=0)
 
             cv2.imshow("Stereo BEV Perception", canvas)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
             if i % 30 == 0:
+                occ_bev = occupancy_to_bev(occ_map)
+                z_hit = int((occ_map.reshape(occ_map.shape[0], -1).sum(1) > 0).sum()) if occ_map.ndim == 3 else 1
                 print(f"  frame {i}/{num_frames}  "
                       f"depth pts: {(depth > 0.1).sum():,}  "
-                      f"BEV occupied: {occ_map.sum()}/{occ_map.size}")
+                      f"occ voxels: {int(occ_map.sum())}/{occ_map.size}  "
+                      f"z_bins={z_hit}  bev cells: {occ_bev.sum()}")
 
     finally:
         rig.destroy()

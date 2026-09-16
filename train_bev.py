@@ -4,7 +4,7 @@ Training script for StereoBEVModel with image-space segmentation.
 The model predicts:
   - Per-pixel semantic segmentation in IMAGE SPACE (camera view)
   - Per-pixel depth from stereo
-  - BEV occupancy grid (lifted from depth + seg)
+  - 3D occupancy volume (lifted from depth + seg)
 
 Usage:
     python train_bev.py --kv-url http://localhost:3000 --epochs 50 --batch-size 2
@@ -28,7 +28,13 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 from stereo_bev.segmentation import NUM_BEV_CLASSES, BEV_CLASSES, BEV_COLORS
-from stereo_bev.query_heads import StereoBEVModel, stereo_bev_loss
+from stereo_bev.query_heads import StereoBEVModel, stereo_bev_loss, GeometricOccHead
+from stereo_bev.bev_grid import (
+    BEVGrid, occupancy_to_bev,
+    DEFAULT_X_RANGE, DEFAULT_Y_RANGE, DEFAULT_Z_RANGE, DEFAULT_VOXEL,
+)
+from stereo_bev.calibration import ego_from_camera
+from stereo_bev.visualize import draw_occ_3d_projections
 from minikeyvalue_client import MiniKV
 
 
@@ -61,17 +67,18 @@ def _norm_bufs(device: torch.device):
     return mean, std
 
 
-def _move_batch(left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, device, mean, std, non_blocking):
+def _move_batch(left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext, device, mean, std, non_blocking):
     left_t = left_t.to(device, non_blocking=non_blocking)
     right_t = right_t.to(device, non_blocking=non_blocking)
     K_t = K_t.to(device, non_blocking=non_blocking)
     seg_gt = seg_gt.to(device, non_blocking=non_blocking)
     occ_gt = occ_gt.to(device, non_blocking=non_blocking)
     bev_seg_gt = bev_seg_gt.to(device, non_blocking=non_blocking)
+    cam_ext = cam_ext.to(device, non_blocking=non_blocking)
     if left_t.dtype == torch.uint8:
         left_t = _imagenet_norm(left_t, mean, std)
         right_t = _imagenet_norm(right_t, mean, std)
-    return left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt
+    return left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext
 
 
 def _load_npz_file(npz) -> tuple:
@@ -92,16 +99,27 @@ class StereoBEVDataset(Dataset):
       right_rgb:  (H, W, 3) uint8 BGR
       depth_gt:   (H, W) float32 meters
       seg_gt:     (H, W) uint8 — IMAGE-SPACE segmentation (camera view)
-      occ_gt:     (bev_h, bev_w) uint8 — BEV occupancy
+      occ_gt:     (Z, bev_h, bev_w) uint8 — 3D occupancy (legacy 2D is re-lifted)
       bev_seg_gt: (bev_h, bev_w) uint8 — BEV per-cell semantic class
       K:          (3, 3) float64 intrinsics
+      cam_ext:    (4, 4) optional ego-from-camera
 
     Loads from local .npz files or minikeyvalue (`--kv-url`).
     """
 
-    def __init__(self, data_dir: str = None, kv_url: str = None, kv_prefix: str = "/train/"):
+    def __init__(self, data_dir: str = None, kv_url: str = None, kv_prefix: str = "/train/",
+                 x_range=DEFAULT_X_RANGE, y_range=DEFAULT_Y_RANGE,
+                 z_range=DEFAULT_Z_RANGE, voxel=DEFAULT_VOXEL, max_depth: float = 80.0):
         self.kv_url = kv_url
         self._kv = None
+        self.max_depth = max_depth
+        self.bev = BEVGrid(
+            x_range=x_range, y_range=y_range, z_range=z_range,
+            voxel_size=voxel, num_classes=NUM_BEV_CLASSES,
+        )
+        self.occ_head = GeometricOccHead(min_hits=2.0)
+        self.legacy_cam_ext = ego_from_camera(pitch_deg=0.0).astype(np.float32)
+        self.expected_occ = (self.bev.grid_z, self.bev.grid_h, self.bev.grid_w)
         if kv_url:
             self.keys = MiniKV(kv_url).list_keys(kv_prefix)
             self.files = None
@@ -132,22 +150,26 @@ class StereoBEVDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.kv_url:
-            left, right, K, depth_gt, seg_gt, occ_gt, bev_seg_gt = _load_npz_file(
-                self._client().get_npz(self.keys[idx])
-            )
+            npz = self._client().get_npz(self.keys[idx])
         else:
-            left, right, K, depth_gt, seg_gt, occ_gt, bev_seg_gt = _load_npz_file(
-                np.load(self.files[idx])
-            )
+            npz = np.load(self.files[idx])
+        left, right, K, depth_gt, seg_gt, occ_gt, bev_seg_gt = _load_npz_file(npz)
+        cam_ext = np.asarray(npz["cam_ext"], dtype=np.float32) if "cam_ext" in npz.files else self.legacy_cam_ext
+        if occ_gt.ndim != 3 or occ_gt.shape != self.expected_occ:
+            res = self.bev.bev_from_frame(depth_gt, seg_gt, K, cam_ext, max_depth=self.max_depth)
+            occ_gt = self.occ_head(res["occupancy_count"])
+            if bev_seg_gt.shape != (self.bev.grid_h, self.bev.grid_w):
+                bev_seg_gt = self.bev.get_bev_semantic(res["class_histogram"])
 
         return (
-            _bgr_to_nchw_uint8(left),            # (3, H, W) uint8 RGB
-            _bgr_to_nchw_uint8(right),           # (3, H, W) uint8 RGB
+            _bgr_to_nchw_uint8(left),
+            _bgr_to_nchw_uint8(right),
             torch.from_numpy(np.ascontiguousarray(K)).float(),
             torch.from_numpy(np.ascontiguousarray(depth_gt)).float(),
             torch.from_numpy(np.ascontiguousarray(seg_gt)).long(),
             torch.from_numpy(np.ascontiguousarray(occ_gt)).float(),
             torch.from_numpy(np.ascontiguousarray(bev_seg_gt)).long(),
+            torch.from_numpy(np.ascontiguousarray(cam_ext)).float(),
         )
 
 
@@ -210,7 +232,9 @@ def render_occ_comparison(
     occ_pred: np.ndarray,
     scale: int = 3,
 ) -> np.ndarray:
-    """Side-by-side BEV occupancy GT vs predicted."""
+    """Side-by-side BEV occupancy GT vs predicted (max-over-Z if 3D)."""
+    occ_gt = occupancy_to_bev(occ_gt)
+    occ_pred = occupancy_to_bev(occ_pred)
     H, W = occ_gt.shape
 
     # upscale occ arrays to match the canvas
@@ -344,18 +368,22 @@ _CUBE_FACES = np.array([
 ], dtype=np.int64)
 
 
-def occ_to_voxel_mesh(occ, voxel_size=0.1, x_range=(-5,5), y_range=(-5,5),
-                       z_min=0.0, color=None):
+def occ_to_voxel_mesh(occ, voxel_size=DEFAULT_VOXEL, x_range=DEFAULT_X_RANGE,
+                       y_range=DEFAULT_Y_RANGE, z_range=DEFAULT_Z_RANGE, color=None):
     """Occupancy grid → cube mesh for TensorBoard add_mesh."""
-    ys, xs = np.where(occ > 0)
-    N = len(ys)
+    occ = np.asarray(occ)
+    if occ.ndim == 2:
+        occ = occ[np.newaxis]
+    zs, ys, xs = np.where(occ > 0)
+    N = len(zs)
     if N == 0:
         return np.zeros((8,3)), np.zeros((12,3),dtype=np.int64), np.zeros((8,3))
 
     base_x = xs * voxel_size + x_range[0]
     base_y = ys * voxel_size + y_range[0]
+    base_z = zs * voxel_size + z_range[0]
     scaled = _CUBE_VERTS * voxel_size
-    offsets = np.stack([base_x, base_y, np.full(N, z_min)], axis=-1)[:, np.newaxis, :]
+    offsets = np.stack([base_x, base_y, base_z], axis=-1)[:, np.newaxis, :]
     verts = (scaled[np.newaxis] + offsets).reshape(-1, 3)
 
     face_off = (np.arange(N) * 8)[:, None, None]
@@ -371,10 +399,12 @@ def occ_to_voxel_mesh(occ, voxel_size=0.1, x_range=(-5,5), y_range=(-5,5),
 
 
 def log_3d_occupancy(writer, gt_occ, pred_occ, epoch, name="occupancy3d",
-                      voxel_size=0.1):
+                      voxel_size=DEFAULT_VOXEL, x_range=DEFAULT_X_RANGE,
+                      y_range=DEFAULT_Y_RANGE, z_range=DEFAULT_Z_RANGE):
     """Log GT + predicted occupancy as 3D voxel cubes."""
-    gt_v, gt_f, gt_c = occ_to_voxel_mesh(gt_occ, voxel_size, color=np.array([0.2, 0.8, 0.2]))
-    pv, pf, pc = occ_to_voxel_mesh(pred_occ, voxel_size, color=np.array([0.9, 0.2, 0.2]))
+    mesh_kw = dict(voxel_size=voxel_size, x_range=x_range, y_range=y_range, z_range=z_range)
+    gt_v, gt_f, gt_c = occ_to_voxel_mesh(gt_occ, color=np.array([0.2, 0.8, 0.2]), **mesh_kw)
+    pv, pf, pc = occ_to_voxel_mesh(pred_occ, color=np.array([0.9, 0.2, 0.2]), **mesh_kw)
     pv[:, 1] += 12.0  # offset pred on Y
 
     n_gt = gt_v.shape[0]
@@ -399,13 +429,13 @@ def evaluate(model, loader, device, mean, std, use_amp=False, non_blocking=False
     n = 0
     amp_cm = torch.cuda.amp.autocast if use_amp else nullcontext
     with torch.no_grad():
-        for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt in loader:
-            left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt = _move_batch(
-                left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt,
+        for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt, cam_ext in loader:
+            left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext = _move_batch(
+                left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext,
                 device, mean, std, non_blocking,
             )
             with amp_cm():
-                seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t)
+                seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t, cam_ext)
                 losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
             bs = left_t.size(0)
             totals["loss"] += losses["loss"].detach() * bs
@@ -417,21 +447,23 @@ def evaluate(model, loader, device, mean, std, use_amp=False, non_blocking=False
 
 
 def log_visualizations(model, loader, writer, device, epoch, mean, std,
-                       bev_voxel=0.1, max_samples=4, use_amp=False, non_blocking=False):
+                       bev_voxel=DEFAULT_VOXEL, max_samples=4, use_amp=False, non_blocking=False):
     """Log comparison images + 3D occupancy to TensorBoard."""
     model.eval()
     count = 0
     amp_cm = torch.cuda.amp.autocast if use_amp else nullcontext
 
     with torch.no_grad():
-        for left_t, right_t, K_t, depth_gt_b, seg_gt_b, occ_gt_b, bev_seg_gt_b in loader:
-            left_t, right_t, K_t, _, _, _ = _move_batch(
-                left_t, right_t, K_t, seg_gt_b, occ_gt_b, bev_seg_gt_b,
+        for left_t, right_t, K_t, depth_gt_b, seg_gt_b, occ_gt_b, bev_seg_gt_b, cam_ext in loader:
+            left_t, right_t, K_t, _, _, _, cam_ext = _move_batch(
+                left_t, right_t, K_t, seg_gt_b, occ_gt_b, bev_seg_gt_b, cam_ext,
                 device, mean, std, non_blocking,
             )
 
             with amp_cm():
-                seg_logits, occ_logits, bev_seg_logits, depth_logits = model(left_t, right_t, K_t)
+                seg_logits, occ_logits, bev_seg_logits, depth_logits = model(
+                    left_t, right_t, K_t, cam_ext,
+                )
 
             B = left_t.size(0)
             for b in range(B):
@@ -478,13 +510,26 @@ def log_visualizations(model, loader, writer, device, epoch, mean, std,
                 seg_cmp = render_seg_comparison(left_np, gt_seg, pred_seg)
                 writer.add_image(f"seg/sample_{count}", seg_cmp.transpose(2, 0, 1), epoch)
 
-                # dedicated occ comparison (BEV)
+                # dedicated occ comparison (BEV max-over-Z)
                 occ_cmp = render_occ_comparison(gt_occ, pred_occ, scale=3)
                 writer.add_image(f"occ/sample_{count}", occ_cmp.transpose(2, 0, 1), epoch)
+
+                # 3D occupancy projections
+                occ3d_cmp = np.concatenate([
+                    draw_occ_3d_projections(gt_occ),
+                    draw_occ_3d_projections(pred_occ),
+                ], axis=1)
+                writer.add_image(f"occ3d/sample_{count}", occ3d_cmp.transpose(2, 0, 1), epoch)
 
                 # dedicated BEV semantic comparison
                 bev_seg_cmp = render_bev_seg_comparison(gt_bev_seg, pred_bev_seg, scale=3)
                 writer.add_image(f"bevseg/sample_{count}", bev_seg_cmp.transpose(2, 0, 1), epoch)
+
+                try:
+                    log_3d_occupancy(writer, gt_occ, pred_occ, epoch,
+                                     name=f"occupancy3d/sample_{count}", voxel_size=bev_voxel)
+                except Exception:
+                    pass
 
                 count += 1
 
@@ -506,7 +551,7 @@ def train(
     data_dir="bev_data", epochs=50, batch_size=2, lr=1e-4,
     checkpoint_path="stereo_bev_model.pth", log_dir="runs/bev_train",
     image_w=960, image_h=540,
-    bev_range_xy=5.0, bev_z_range=5.0, bev_voxel=0.1, max_depth=80.0,
+    bev_range_xy=None, bev_z_range=None, bev_voxel=DEFAULT_VOXEL, max_depth=80.0,
     viz_every=5, resume=False, kv_url=None,
     workers=4, amp=True, device=None,
 ):
@@ -529,13 +574,17 @@ def train(
     else:
         print("[Train] Device: cpu  (CUDA not available)")
 
+    ds_kw = dict(
+        x_range=DEFAULT_X_RANGE, y_range=DEFAULT_Y_RANGE,
+        z_range=DEFAULT_Z_RANGE, voxel=bev_voxel, max_depth=max_depth,
+    )
     if kv_url:
-        train_dataset = StereoBEVDataset(kv_url=kv_url, kv_prefix="/train/")
-        val_dataset = StereoBEVDataset(kv_url=kv_url, kv_prefix="/val/")
+        train_dataset = StereoBEVDataset(kv_url=kv_url, kv_prefix="/train/", **ds_kw)
+        val_dataset = StereoBEVDataset(kv_url=kv_url, kv_prefix="/val/", **ds_kw)
         print(f"[Train] KV mode: {kv_url}")
     else:
-        train_dataset = StereoBEVDataset(data_dir=os.path.join(data_dir, "train"))
-        val_dataset = StereoBEVDataset(data_dir=os.path.join(data_dir, "val"))
+        train_dataset = StereoBEVDataset(data_dir=os.path.join(data_dir, "train"), **ds_kw)
+        val_dataset = StereoBEVDataset(data_dir=os.path.join(data_dir, "val"), **ds_kw)
     print(f"[Train] Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     print(f"[Train] DataLoader workers={workers}  amp={use_amp}  pin_memory={use_cuda}")
 
@@ -548,9 +597,9 @@ def train(
 
     model = StereoBEVModel(
         num_classes=NUM_BEV_CLASSES, image_h=image_h, image_w=image_w,
-        bev_x_range=(-bev_range_xy, bev_range_xy),
-        bev_y_range=(-bev_range_xy, bev_range_xy),
-        bev_z_range=(0.0, bev_z_range), bev_voxel=bev_voxel,
+        bev_x_range=DEFAULT_X_RANGE,
+        bev_y_range=DEFAULT_Y_RANGE,
+        bev_z_range=DEFAULT_Z_RANGE, bev_voxel=bev_voxel,
         max_depth=max_depth, pretrained_backbone=True,
     ).to(device)
 
@@ -586,15 +635,15 @@ def train(
         totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg")}
         n = 0
 
-        for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt in train_loader:
-            left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt = _move_batch(
-                left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt,
+        for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt, cam_ext in train_loader:
+            left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext = _move_batch(
+                left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext,
                 device, mean, std, non_blocking,
             )
 
             optimizer.zero_grad(set_to_none=True)
             with amp_cm():
-                seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t)
+                seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t, cam_ext)
                 losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
             scaler.scale(losses["loss"]).backward()
             scaler.step(optimizer)
@@ -664,8 +713,9 @@ if __name__ == "__main__":
     parser.add_argument("--viz-every", type=int, default=5)
     parser.add_argument("--image-w", type=int, default=960)
     parser.add_argument("--image-h", type=int, default=540)
-    parser.add_argument("--bev-range", type=float, default=5.0)
-    parser.add_argument("--bev-voxel", type=float, default=0.1)
+    parser.add_argument("--bev-range", type=float, default=None,
+                        help="Unused; occupancy volume is 0–20m / ±10m / −1–3m")
+    parser.add_argument("--bev-voxel", type=float, default=DEFAULT_VOXEL)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--kv-url", default=None, help="minikeyvalue URL (e.g. http://localhost:3000)")
     parser.add_argument("--workers", type=int, default=4,
@@ -677,6 +727,6 @@ if __name__ == "__main__":
     train(data_dir=args.data, epochs=args.epochs, batch_size=args.batch_size,
           lr=args.lr, checkpoint_path=args.output, log_dir=args.logdir,
           viz_every=args.viz_every, image_w=args.image_w, image_h=args.image_h,
-          bev_range_xy=args.bev_range, bev_voxel=args.bev_voxel, resume=args.resume,
+          bev_voxel=args.bev_voxel, resume=args.resume,
           kv_url=args.kv_url, workers=args.workers, amp=not args.no_amp,
           device=args.device)
