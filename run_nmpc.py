@@ -33,10 +33,68 @@ from stereo_bev.occ_field import occupancy_to_esdf_3d, obstacle_volume, query_es
 from stereo_bev.query_heads import GeometricOccHead, HAS_TORCH
 from stereo_bev.segmentation import remap_segmentation, NUM_BEV_CLASSES
 from stereo_bev.vehicle_body import model3_body_samples, body_sweep_voxels, transform_body
+from stereo_bev.rerun_vis import RerunOccViewer, is_available as rerun_available
 from stereo_bev.visualize import (
     draw_bev_map, draw_legend, draw_depth_heatmap,
-    draw_planning_on_bev, draw_occ_3d_with_sweep,
+    draw_planning_on_bev, draw_control_curves,
 )
+
+
+def _banner(img: np.ndarray, text: str) -> np.ndarray:
+    bar = np.zeros((22, img.shape[1], 3), dtype=np.uint8)
+    cv2.putText(bar, text, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    return np.concatenate([bar, img], axis=0)
+
+
+def _hpad(img: np.ndarray, width: int) -> np.ndarray:
+    if img.shape[1] >= width:
+        return img
+    pad = np.zeros((img.shape[0], width - img.shape[1], 3), dtype=np.uint8)
+    return np.concatenate([img, pad], axis=1)
+
+
+def _vpad(img: np.ndarray, height: int) -> np.ndarray:
+    if img.shape[0] >= height:
+        return img
+    pad = np.zeros((height - img.shape[0], img.shape[1], 3), dtype=np.uint8)
+    return np.concatenate([img, pad], axis=0)
+
+
+def _hstack(imgs: list[np.ndarray]) -> np.ndarray:
+    h = max(im.shape[0] for im in imgs)
+    return np.concatenate([_vpad(im, h) for im in imgs], axis=1)
+
+
+def _vstack(imgs: list[np.ndarray]) -> np.ndarray:
+    w = max(im.shape[1] for im in imgs)
+    return np.concatenate([_hpad(im, w) for im in imgs], axis=0)
+
+
+def _side_legend(height: int) -> np.ndarray:
+    panel = np.full((height, 150, 3), 24, dtype=np.uint8)
+    panel = draw_legend(panel, top_left=(8, 8))
+    y = 8 + 16 * NUM_BEV_CLASSES + 14
+    keys = (
+        ((255, 220, 0), "route"),
+        ((0, 255, 255), "nmpc"),
+        ((0, 0, 255), "target"),
+        ((255, 255, 255), "ego"),
+    )
+    for color, name in keys:
+        cv2.rectangle(panel, (8, y), (24, y + 12), color, -1)
+        cv2.putText(panel, name, (30, y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        y += 16
+    return panel
+
+
+def _steer_max_rad(vehicle) -> float:
+    try:
+        ang = float(vehicle.get_physics_control().wheels[0].max_steer_angle)
+    except Exception:
+        ang = 70.0
+    if ang > 2.0:
+        return math.radians(ang)
+    return max(ang, 1e-3)
 
 
 def _speed(vehicle) -> float:
@@ -79,6 +137,9 @@ def run(
     z_ground: float = 0.5,
     horizon_s: float = 5.0,
     dt: float = 0.2,
+    v_max: float = 2.0,
+    use_rerun: bool = True,
+    use_opencv: bool = True,
 ):
     import carla
 
@@ -106,6 +167,7 @@ def run(
         world.tick()
         vehicle = world.spawn_actor(vehicle_bp, spawn_point)
     world.tick()
+    steer_max_rad = _steer_max_rad(vehicle)
 
     collision_bp = bp_lib.find("sensor.other.collision")
     collision_sensor = world.spawn_actor(
@@ -170,7 +232,7 @@ def run(
 
     body = model3_body_samples()
     print("[NMPC] Building CasADi problem (once)...")
-    nmpc = OccupancyNMPC(grid=bev, body=body, horizon_s=horizon_s, dt=dt, v_max=1.0)
+    nmpc = OccupancyNMPC(grid=bev, body=body, horizon_s=horizon_s, dt=dt, v_max=v_max)
     global_tgt = GlobalTarget(world, vehicle, horizon_s=horizon_s, d_min=5.0, d_max=bev_x_range[1])
 
     writer = None
@@ -187,9 +249,21 @@ def run(
         writer.writeheader()
 
     cam_extrinsic = rig.cam_extrinsic
+    rerun_viewer = None
+    if use_rerun:
+        if not rerun_available():
+            print("[NMPC] rerun-sdk not installed; 3D view disabled (pip install rerun-sdk)")
+        else:
+            try:
+                rerun_viewer = RerunOccViewer(bev, spawn=True)
+                print("[NMPC] 3D occupancy is in the Rerun viewer (FLU: +X forward, +Y left, +Z up)")
+            except Exception as exc:
+                print(f"[NMPC] rerun viewer failed ({exc}); continuing without it", flush=True)
+                rerun_viewer = None
+
     print(f"[NMPC] mode={mode}  closed_loop={closed_loop}  T={horizon_s}s dt={dt}  v_max={nmpc.v_max:.1f}m/s")
     print(f"[NMPC] occupancy {bev.grid_z}x{bev.grid_h}x{bev.grid_w}  voxel={bev_voxel}m")
-    print("[NMPC] Press 'q' to quit")
+    print("[NMPC] Press 'q' in the OpenCV window to quit")
 
     num_frames = int(duration_sec * fps)
     last_u = np.zeros(2)
@@ -200,6 +274,7 @@ def run(
                 ctrl = nmpc_to_carla_control(
                     float(last_u[0]), float(last_u[1]),
                     speed=speed, v_max=nmpc.v_max,
+                    steer_max_rad=steer_max_rad,
                 )
                 vehicle.apply_control(ctrl)
             world.tick()
@@ -210,6 +285,8 @@ def run(
                 continue
 
             left_rgb = data["left_rgb"]
+            cls_hist = None
+            voxel_class = None
             if model is not None:
                 _, occ_map, bev_classes, _ = model.infer(
                     left_rgb, data["right_rgb"], rig.K, device=device, cam_ext=cam_extrinsic,
@@ -222,14 +299,18 @@ def run(
                     depth_map=depth, seg_map=seg_bev, K=rig.K,
                     cam_extrinsic=cam_extrinsic, max_depth=max_depth,
                 )
-                bev_classes = bev.get_bev_semantic(bev_result["class_histogram"])
+                cls_hist = bev_result["class_histogram"]
+                voxel_class = bev_result["voxel_class"]
+                bev_classes = bev.get_bev_semantic(cls_hist)
                 occ_map = occ_head_geo(bev_result["occupancy_count"])
 
             occ_obs = obstacle_volume(
-                occ_map, bev, z_ground=z_ground, bev_classes=bev_classes,
+                occ_map, bev, z_ground=z_ground, voxel_class=voxel_class,
+                bev_classes=bev_classes,
             )
             esdf = occupancy_to_esdf_3d(
-                occ_map, bev, z_ground=z_ground, bev_classes=bev_classes,
+                occ_map, bev, z_ground=z_ground, voxel_class=voxel_class,
+                bev_classes=bev_classes,
             )
             plan = global_tgt.update(speed=speed, n_knots=nmpc.N + 1)
             tf = vehicle.get_transform()
@@ -247,64 +328,91 @@ def run(
             cte = _cross_track(plan["route_ego"])
 
             bev_scale = 4
-            bev_img = draw_bev_map(bev_classes, occ_obs, scale=bev_scale)
+            bev_img = draw_bev_map(bev_classes, occ_obs, scale=bev_scale, mark_center=False)
             bev_img = draw_planning_on_bev(
                 bev_img, bev, bev_scale,
                 traj_xy=traj_vis[:, :2],
                 route_xy=plan["route_ego"],
                 target_xy=plan["target"][:2],
             )
-            bev_img = draw_legend(bev_img, top_left=(bev_img.shape[1] - 130, 10))
+            bev_img = np.ascontiguousarray(np.fliplr(np.rot90(bev_img, k=1)))
+            bev_img = np.concatenate([bev_img, _side_legend(bev_img.shape[0])], axis=1)
+            bev_img = _banner(bev_img, "BEV  +X up  cyan=route  yellow=nmpc")
 
+            cam_h = 240
+            cam_w = int(cam_h * image_w / image_h)
+            left_small = cv2.resize(left_rgb, (cam_w, cam_h))
             depth_vis = draw_depth_heatmap(depth, max_depth=max_depth)
-            bev_h = bev_img.shape[0]
-            cam_w = int(bev_h * image_w / image_h)
-            left_small = cv2.resize(left_rgb, (cam_w, bev_h))
-            depth_small = cv2.resize(depth_vis, (cam_w, bev_h))
-            cam_total = left_small.shape[1] + depth_small.shape[1]
-            bev_w = bev_img.shape[1]
-            if cam_total < bev_w:
-                pad = np.zeros((bev_h, bev_w - cam_total, 3), dtype=np.uint8)
-                top_row = np.concatenate([left_small, depth_small, pad], axis=1)
-            elif cam_total > bev_w:
-                crop_w = bev_w // 2
-                left_small = cv2.resize(left_small, (crop_w, bev_h))
-                depth_small = cv2.resize(depth_small, (bev_w - crop_w, bev_h))
-                top_row = np.concatenate([left_small, depth_small], axis=1)
-            else:
-                top_row = np.concatenate([left_small, depth_small], axis=1)
-
-            occ_panel = draw_occ_3d_with_sweep(
-                occ_obs.astype(np.uint8), sweep=sweep,
-                traj_xy=traj_vis[:, :2], route_xy=plan["route_ego"],
-                target_xy=plan["target"][:2], grid=bev, scale=3,
-                x_range=bev.x_range, y_range=bev.y_range, z_range=bev.z_range,
-            )
-
-            canvas = np.concatenate([top_row, bev_img], axis=0)
-            if occ_panel.shape[1] < canvas.shape[1]:
-                pad = np.zeros((occ_panel.shape[0], canvas.shape[1] - occ_panel.shape[1], 3), dtype=np.uint8)
-                occ_panel = np.concatenate([occ_panel, pad], axis=1)
-            elif occ_panel.shape[1] > canvas.shape[1]:
-                occ_panel = occ_panel[:, :canvas.shape[1]]
-            canvas = np.concatenate([canvas, occ_panel], axis=0)
-
+            depth_small = cv2.resize(depth_vis, (cam_w, cam_h))
             hud = (
                 f"{'CLOSED' if closed_loop else 'OPEN'}  "
                 f"v={speed:4.1f}m/s  solve={sol['solve_ms']:.0f}ms  "
                 f"{sol['status']}  terr={sol['terminal_err']:.1f}m  "
                 f"dmin={sol['min_clearance']:.2f}m  cte={cte:.2f}  col={collisions['n']}"
             )
-            cv2.putText(canvas, hud, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(canvas, hud, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+            cv2.putText(left_small, hud, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(left_small, hud, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (240, 240, 240), 1, cv2.LINE_AA)
+            cam_col = _vstack([
+                _banner(left_small, "left RGB"),
+                _banner(depth_small, "depth"),
+            ])
 
-            try:
-                cv2.imshow("NMPC 3D occupancy", canvas)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-            except cv2.error as exc:
-                if i == 0:
-                    print(f"[NMPC] viz unavailable ({exc}); continuing headless", flush=True)
+            if rerun_viewer is not None and i % 2 == 0:
+                try:
+                    log_cams = (i % 10 == 0)
+                    rerun_viewer.log_frame(
+                        i,
+                        occ=occ_obs.astype(np.uint8),
+                        sweep=sweep,
+                        bev_classes=bev_classes,
+                        voxel_class=voxel_class,
+                        traj_xy=traj_vis[:, :2],
+                        route_xy=plan["route_ego"],
+                        target_xy=plan["target"][:2],
+                        rgb_bgr=left_rgb if log_cams else None,
+                        depth=depth if log_cams else None,
+                        bev_bgr=bev_img if log_cams else None,
+                        speed=speed,
+                        accel=float(last_u[0]),
+                        steer=float(last_u[1]),
+                        clearance=float(sol["min_clearance"]),
+                        max_depth=max_depth,
+                    )
+                except Exception as exc:
+                    print(f"[NMPC] rerun log failed ({exc}); disabling 3D viewer", flush=True)
+                    try:
+                        rerun_viewer.close()
+                    except Exception:
+                        pass
+                    rerun_viewer = None
+
+            if use_opencv:
+                ctrl_panel = draw_control_curves(
+                    sol["u"], dt=dt, a_max=nmpc.a_max, delta_max=nmpc.delta_max,
+                    width=bev_img.shape[1], height=140,
+                )
+                mid_col = _vstack([
+                    bev_img,
+                    _banner(ctrl_panel, "u(t)  a green  delta orange"),
+                ])
+                canvas = _hstack([cam_col, mid_col])
+                try:
+                    if i == 0:
+                        cv2.namedWindow("NMPC 3D occupancy", cv2.WINDOW_NORMAL)
+                        max_w, max_h = 1600, 900
+                        scale = min(max_w / canvas.shape[1], max_h / canvas.shape[0], 1.0)
+                        cv2.resizeWindow(
+                            "NMPC 3D occupancy",
+                            max(int(canvas.shape[1] * scale), 640),
+                            max(int(canvas.shape[0] * scale), 360),
+                        )
+                        cv2.moveWindow("NMPC 3D occupancy", 30, 40)
+                    cv2.imshow("NMPC 3D occupancy", canvas)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error as exc:
+                    if i == 0:
+                        print(f"[NMPC] opencv viz unavailable ({exc}); continuing", flush=True)
 
             if writer is not None:
                 writer.writerow({
@@ -344,6 +452,8 @@ def run(
         settings.synchronous_mode = False
         world.apply_settings(settings)
         tm.set_synchronous_mode(False)
+        if rerun_viewer is not None:
+            rerun_viewer.close()
         try:
             cv2.destroyAllWindows()
         except cv2.error:
@@ -361,11 +471,15 @@ def main():
     p.add_argument("--model-checkpoint", default=None)
     p.add_argument("--metrics-csv", default="nmpc_metrics.csv")
     p.add_argument("--fps", type=float, default=15.0)
+    p.add_argument("--v-max", type=float, default=2.0, help="NMPC speed limit (m/s)")
+    p.add_argument("--no-rerun", action="store_true", help="Disable the Rerun 3D occupancy viewer")
+    p.add_argument("--no-opencv", action="store_true", help="Disable the OpenCV HUD window")
     args = p.parse_args()
     run(
         host=args.host, port=args.port, duration_sec=args.duration,
         fps=args.fps, mode=args.mode, model_checkpoint=args.model_checkpoint,
         closed_loop=args.closed_loop, metrics_csv=args.metrics_csv,
+        v_max=args.v_max, use_rerun=not args.no_rerun, use_opencv=not args.no_opencv,
     )
 
 

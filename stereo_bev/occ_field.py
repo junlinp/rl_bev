@@ -7,8 +7,9 @@ import numpy as np
 from .bev_grid import BEVGrid
 from .vehicle_body import MODEL3_LENGTH, MODEL3_WIDTH
 
-# BEV classes treated as planning obstacles (not road / sidewalk / terrain / vegetation / other).
-OBSTACLE_BEV_CLASSES = (3, 4, 5, 8)  # vehicle, ped, building, pole_sign
+# BEV classes treated as planning obstacles (not road / sidewalk / terrain / vegetation).
+# "other" keeps CARLA Static / Fence / GuardRail from being wiped with the road.
+OBSTACLE_BEV_CLASSES = (3, 4, 5, 8, 9)  # vehicle, ped, building, pole_sign, other
 
 
 def esdf_axis_grids(grid: BEVGrid) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -24,7 +25,9 @@ def obstacle_volume(
     occ: np.ndarray,
     grid: BEVGrid,
     z_ground: float = 0.5,
+    voxel_class: np.ndarray | None = None,
     bev_classes: np.ndarray | None = None,
+    class_histogram: np.ndarray | None = None,
     clear_ego: bool = True,
     inflate_m: float = 0.4,
     ego_x_max: float | None = None,
@@ -35,6 +38,10 @@ def obstacle_volume(
 
     Clears ground (z < z_ground), the ego footprint, and non-obstacle
     semantics; optional binary inflation. No XY max-collapse.
+
+    ``voxel_class`` is (Z, Y, X): each voxel keeps its own class. Road at
+    the ground does not wipe a pole voxel above it. 2D ``bev_classes`` /
+    Z-collapsed histograms are only a fallback.
     """
     if occ.ndim != 3:
         raise ValueError(f"expected 3D occupancy (Z,Y,X), got shape {occ.shape}")
@@ -49,10 +56,37 @@ def obstacle_volume(
     _, _, z_coords = esdf_axis_grids(grid)
     occupied[z_coords < z_ground, :, :] = False
 
-    if bev_classes is not None:
-        cls = np.asarray(bev_classes)
-        if cls.shape == occupied.shape[1:]:
-            obs_xy = np.isin(cls, OBSTACLE_BEV_CLASSES)
+    cls3 = None
+    if voxel_class is not None:
+        vc = np.asarray(voxel_class)
+        if vc.shape == occupied.shape:
+            cls3 = vc
+    if cls3 is None and class_histogram is not None:
+        hist = np.asarray(class_histogram)
+        if hist.ndim == 4 and hist.shape[1:] == occupied.shape:
+            cls3 = hist.argmax(axis=0).astype(np.uint8)
+            cls3[hist.sum(axis=0) <= 0] = 0
+
+    if cls3 is not None:
+        is_obs = np.isin(cls3, OBSTACLE_BEV_CLASSES)
+        is_free_sem = (cls3 != 0) & ~is_obs
+        occupied |= is_obs
+        occupied &= ~is_free_sem
+        occupied[z_coords < z_ground, :, :] = False
+    else:
+        obs_xy = None
+        if class_histogram is not None:
+            hist = np.asarray(class_histogram)
+            if hist.ndim == 3 and hist.shape[1:] == occupied.shape[1:]:
+                idx = np.array(OBSTACLE_BEV_CLASSES, dtype=np.int32)
+                idx = idx[idx < hist.shape[0]]
+                if idx.size:
+                    obs_xy = hist[idx].sum(axis=0) > 0
+        if obs_xy is None and bev_classes is not None:
+            cls = np.asarray(bev_classes)
+            if cls.shape == occupied.shape[1:]:
+                obs_xy = np.isin(cls, OBSTACLE_BEV_CLASSES)
+        if obs_xy is not None:
             occupied &= obs_xy[None, :, :]
 
     if inflate_m > 0 and occupied.any():
@@ -82,7 +116,9 @@ def occupancy_to_esdf_3d(
     grid: BEVGrid,
     z_ground: float = 0.5,
     max_dist: float | None = None,
+    voxel_class: np.ndarray | None = None,
     bev_classes: np.ndarray | None = None,
+    class_histogram: np.ndarray | None = None,
     clear_ego: bool = True,
     inflate_m: float = 0.4,
 ) -> np.ndarray:
@@ -92,7 +128,8 @@ def occupancy_to_esdf_3d(
     Distances are in meters: positive outside obstacles, negative inside.
     """
     occupied = obstacle_volume(
-        occ, grid, z_ground=z_ground, bev_classes=bev_classes,
+        occ, grid, z_ground=z_ground, voxel_class=voxel_class,
+        bev_classes=bev_classes, class_histogram=class_histogram,
         clear_ego=clear_ego, inflate_m=inflate_m,
     )
 
