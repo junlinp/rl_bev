@@ -4,7 +4,7 @@ import threading
 import numpy as np
 import carla
 
-from .calibration import intrinsics_from_carla
+from .calibration import intrinsics_from_carla, ego_from_camera, DEFAULT_PITCH_DEG
 
 
 class CameraRig:
@@ -27,22 +27,32 @@ class CameraRig:
         fps: float = 15.0,
         baseline: float = 0.12,
         mount_offset: tuple[float, float, float] = (1.5, 0.0, 1.6),
+        pitch_deg: float = DEFAULT_PITCH_DEG,
     ):
         self.w = image_w
         self.h = image_h
         self.baseline = baseline
+        self.pitch_deg = pitch_deg
         self.lock = threading.Lock()
         self._frames: dict[str, tuple[int, np.ndarray]] = {}
 
         # intrinsics (same for both cameras)
         self.K, self.focal_px = intrinsics_from_carla(image_w, image_h, fov)
 
-        # mount transforms
+        # mount transforms (pitch down so the near ground lands in the BEV volume)
         x0, y0, z0 = mount_offset
         half_b = baseline / 2.0
+        rotation = carla.Rotation(pitch=pitch_deg, yaw=0.0, roll=0.0)
 
-        left_mount = carla.Transform(carla.Location(x=x0, y=y0 - half_b, z=z0))
-        right_mount = carla.Transform(carla.Location(x=x0, y=y0 + half_b, z=z0))
+        left_mount = carla.Transform(
+            carla.Location(x=x0, y=y0 - half_b, z=z0), rotation,
+        )
+        right_mount = carla.Transform(
+            carla.Location(x=x0, y=y0 + half_b, z=z0), rotation,
+        )
+
+        # depth + seg live on the left camera
+        self.cam_extrinsic = ego_from_camera((x0, y0 - half_b, z0), pitch_deg)
 
         # blueprints — all sensors share same resolution/fov
         bp_lib = world.get_blueprint_library()
