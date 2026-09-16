@@ -96,7 +96,8 @@ class BEVGrid:
 
         Returns dict with:
             occupancy_count: (grid_z, grid_h, grid_w) hit count
-            class_histogram: (num_classes, grid_h, grid_w) per-class weighted count
+            class_histogram: (num_classes, grid_h, grid_w) Z-sum, for the 2D BEV map
+            voxel_class:     (grid_z, grid_h, grid_w) per-voxel class (no Z collapse)
         """
         N = points_ego.shape[0]
         xi, yi = self.world_to_grid(points_ego[:, 0], points_ego[:, 1])
@@ -120,16 +121,23 @@ class BEVGrid:
         occ = np.zeros((self.grid_z, self.grid_h, self.grid_w), dtype=np.float32)
         np.add.at(occ, (zi, yi, xi), weights)
 
-        # per-class histogram collapsed along Z
-        cls_hist = np.zeros((self.num_classes, self.grid_h, self.grid_w), dtype=np.float32)
+        cls_3d = np.zeros(
+            (self.num_classes, self.grid_z, self.grid_h, self.grid_w), dtype=np.float32,
+        )
         if class_labels is not None:
-            # flatten (z, y, x) → one index for add.at
             for c in range(self.num_classes):
                 mask = class_labels == c
                 if mask.any():
-                    np.add.at(cls_hist[c], (yi[mask], xi[mask]), weights[mask])
+                    np.add.at(cls_3d[c], (zi[mask], yi[mask], xi[mask]), weights[mask])
+        cls_hist = cls_3d.sum(axis=1)
+        voxel_class = cls_3d.argmax(axis=0).astype(np.uint8)
+        voxel_class[cls_3d.sum(axis=0) <= 0] = 0
 
-        return {"occupancy_count": occ, "class_histogram": cls_hist}
+        return {
+            "occupancy_count": occ,
+            "class_histogram": cls_hist,
+            "voxel_class": voxel_class,
+        }
 
     def bev_from_frame(
         self,
@@ -158,6 +166,7 @@ class BEVGrid:
             return {
                 "occupancy_count": np.zeros((self.grid_z, self.grid_h, self.grid_w), dtype=np.float32),
                 "class_histogram": np.zeros((self.num_classes, self.grid_h, self.grid_w), dtype=np.float32),
+                "voxel_class": np.zeros((self.grid_z, self.grid_h, self.grid_w), dtype=np.uint8),
             }
 
         points_ego = self.camera_to_ego(points_cam, cam_extrinsic)
@@ -190,9 +199,10 @@ class BEVGrid:
     @staticmethod
     def get_bev_semantic(class_histogram: np.ndarray) -> np.ndarray:
         """
-        Collapse class histogram → (grid_h, grid_w) argmax class.
+        Collapse a 2D class histogram → (H, W) argmax class.
 
-        Returns class index per cell. 0 (empty) for cells with no hits.
+        This is only for the bird's-eye map. 3D occupancy uses per-voxel
+        ``voxel_class``, not this XY collapse.
         """
         total = class_histogram.sum(axis=0)
         # argmax over class axis; cells with 0 hits stay 0 (empty)

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import time
 import numpy as np
 
 from .bev_grid import BEVGrid
 from .global_target import transform_states_between_ego, wrap_angle
 from .occ_field import esdf_axis_grids, flatten_esdf_casadi, query_esdf
-from .vehicle_body import MODEL3_WHEELBASE, transform_body
+from .vehicle_body import MODEL3_WHEELBASE, MODEL3_MAX_STEER_DEG, transform_body
 
 try:
     import casadi as ca
@@ -37,7 +38,7 @@ class OccupancyNMPC:
         d0: float = 0.40,
         a_max: float = 3.0,
         delta_max: float = 0.50,
-        v_max: float = 1.0,
+        v_max: float = 2.0,
         w_pos: float = 2.0,
         w_yaw: float = 0.4,
         w_term_pos: float = 5.0,
@@ -255,25 +256,16 @@ class OccupancyNMPC:
 
     def _stitch_x0(self, v: float, ego_xy_yaw) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Start the new plan at the previous trajectory's ~200 ms knot,
-        sampled from the last vehicle origin (not from the last virtual x0).
+        New plan starts at the current vehicle (ego origin). Warm-start from the
+        previous trajectory expressed in this frame so IPOPT stays close.
         """
-        tau = self.stitch_s
-        pred = self._to_current_ego(self._interp_traj(self._last_X, tau), ego_xy_yaw)[:, 0]
-        if v < 0.4:
-            x0 = np.array([0.0, 0.0, 0.0, v], dtype=np.float64)
-        else:
-            x0 = pred
-            x0[3] = v
-        t_x = tau + np.arange(self.N + 1, dtype=np.float64) * self.dt
-        t_u = tau + np.arange(self.N, dtype=np.float64) * self.dt
+        x0 = np.array([0.0, 0.0, 0.0, v], dtype=np.float64)
+        t_x = np.arange(self.N + 1, dtype=np.float64) * self.dt
+        t_u = np.arange(self.N, dtype=np.float64) * self.dt
         Xg = self._to_current_ego(self._interp_traj(self._last_X, t_x), ego_xy_yaw)
         Ug = self._interp_u(self._last_U, t_u)
         Xg[:, 0] = x0
-        stub = self._to_current_ego(
-            self._interp_traj(self._last_X, np.linspace(0.0, tau, num=5)),
-            ego_xy_yaw,
-        )
+        stub = x0.reshape(4, 1)
         return x0, Xg, Ug, stub
 
     def solve(
@@ -288,9 +280,9 @@ class OccupancyNMPC:
         """
         Solve one NMPC step.
 
-        After the first call, X[:,0] is the previous plan evaluated at ~200 ms
-        (solve delay), expressed in the current ego frame, so consecutive
-        trajectories stay C0-continuous.
+        After the first call, the previous plan is transformed into the
+        current ego frame as a warm start. X[:,0] is always the live
+        vehicle (0, 0, 0, v) so the predicted trajectory starts at the car.
         """
         v = float(np.clip(v, 0.0, self.v_max))
         target = np.asarray(target, dtype=np.float64).reshape(3)
@@ -358,17 +350,8 @@ class OccupancyNMPC:
 
         if not used_fallback:
             veh0 = np.array([0.0, 0.0, 0.0, v], dtype=np.float64)
-            if float(np.hypot(X[0, 0], X[1, 0])) < 0.05:
-                stored = X.copy()
-                stored[:, 0] = veh0
-            else:
-                tpts = np.concatenate([
-                    [0.0],
-                    self.stitch_s + np.arange(self.N + 1, dtype=np.float64) * self.dt,
-                ])
-                Tpts = np.hstack([veh0.reshape(4, 1), X])
-                stored = self._interp_traj(Tpts, np.arange(self.N + 1) * self.dt, t=tpts)
-                stored[:, 0] = veh0
+            stored = X.copy()
+            stored[:, 0] = veh0
             self._last_X, self._last_U = stored, U
             self._last_ego_xy_yaw = ego_xy_yaw
             self._last_solve_s = solve_ms / 1000.0
@@ -406,12 +389,14 @@ def nmpc_to_carla_control(
     delta_max: float = 0.50,
     speed: float | None = None,
     v_max: float | None = None,
+    steer_max_rad: float | None = None,
 ):
     """
     Map NMPC (a, delta) to carla.VehicleControl.
 
-    NMPC delta is right-handed (positive = left / +Y). CARLA steer positive is right.
-    If speed exceeds v_max, throttle is cut and brake is applied.
+    NMPC delta is the bicycle wheel angle in radians (positive = left / +Y).
+    CARLA ``steer`` is a fraction of the vehicle's max steer angle, and
+    positive steer is right, so we scale by ``steer_max_rad`` and negate.
     """
     import carla
 
@@ -435,5 +420,7 @@ def nmpc_to_carla_control(
     else:
         throttle = 0.0
         brake = float(np.clip(-a / max(a_max, 1e-3), 0.0, 1.0))
-    steer = float(np.clip(-delta / max(delta_max, 1e-3), -1.0, 1.0))
+    if steer_max_rad is None:
+        steer_max_rad = math.radians(MODEL3_MAX_STEER_DEG)
+    steer = float(np.clip(-delta / max(float(steer_max_rad), 1e-3), -1.0, 1.0))
     return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)

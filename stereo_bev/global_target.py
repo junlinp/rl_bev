@@ -1,8 +1,10 @@
 """5 s target pose and knot reference from CARLA GlobalRoutePlanner.
 
-CARLA vehicle frame is X forward, Y right, Z up (left-handed yaw).
-Ego / BEV / NMPC frame is X forward, Y left, Z up (right-handed yaw).
-World→ego conversion flips Y and negates relative yaw.
+CARLA vehicle frame is X forward, Y right, Z up.
+Ego / BEV / NMPC frame is X forward, Y left, Z up.
+
+World waypoints are mapped through the vehicle SE(3) pose, then Y is
+flipped into the ego BEV frame.
 """
 
 from __future__ import annotations
@@ -16,23 +18,95 @@ def wrap_angle(yaw: np.ndarray | float) -> np.ndarray | float:
     return (np.asarray(yaw, dtype=np.float64) + np.pi) % (2.0 * np.pi) - np.pi
 
 
+def carla_rotation_matrix(pitch: float, yaw: float, roll: float) -> np.ndarray:
+    """CARLA/Unreal vehicle-local → world rotation. Angles in radians."""
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    return np.array([
+        [cp * cy, cy * sp * sr - sy * cr, -cy * sp * cr - sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, -sy * sp * cr + cy * sr],
+        [sp, -cp * sr, cp * cr],
+    ], dtype=np.float64)
+
+
+def _as_se3_pose(pose) -> tuple[np.ndarray, np.ndarray]:
+    """
+    World-from-vehicle SE(3) as (t, R).
+
+    pose may be:
+      (x, y, yaw)                              — planar, radians
+      (x, y, z, pitch, yaw, roll)              — radians
+      (4, 4) matrix
+      CARLA Transform (uses get_matrix when present)
+    """
+    if hasattr(pose, "get_matrix"):
+        T = np.array(pose.get_matrix(), dtype=np.float64)
+        return T[:3, 3].copy(), T[:3, :3].copy()
+    if isinstance(pose, np.ndarray) and pose.shape == (4, 4):
+        return pose[:3, 3].astype(np.float64).copy(), pose[:3, :3].astype(np.float64).copy()
+    if hasattr(pose, "location") and hasattr(pose, "rotation"):
+        loc, rot = pose.location, pose.rotation
+        t = np.array([loc.x, loc.y, loc.z], dtype=np.float64)
+        R = carla_rotation_matrix(
+            math.radians(rot.pitch), math.radians(rot.yaw), math.radians(rot.roll),
+        )
+        return t, R
+    arr = tuple(float(v) for v in pose)
+    if len(arr) == 3:
+        x, y, yaw = arr
+        return np.array([x, y, 0.0], dtype=np.float64), carla_rotation_matrix(0.0, yaw, 0.0)
+    if len(arr) == 6:
+        x, y, z, pitch, yaw, roll = arr
+        return np.array([x, y, z], dtype=np.float64), carla_rotation_matrix(pitch, yaw, roll)
+    raise TypeError(f"unsupported SE(3) pose: {type(pose)!r}")
+
+
+def pose_from_carla_transform(tf) -> tuple[float, float, float, float, float, float]:
+    """CARLA Transform → (x, y, z, pitch, yaw, roll) with angles in radians."""
+    loc, rot = tf.location, tf.rotation
+    return (
+        float(loc.x), float(loc.y), float(loc.z),
+        math.radians(rot.pitch), math.radians(rot.yaw), math.radians(rot.roll),
+    )
+
+
 def world_to_ego_bev(
     wx: np.ndarray,
     wy: np.ndarray,
-    ego_xy_yaw: tuple[float, float, float],
+    pose,
+    wz: np.ndarray | float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    CARLA world XY → ego BEV XY (Y left).
+    CARLA world points → ego BEV XY (Y left) via the vehicle SE(3) pose.
 
-    ego_xy_yaw: (x, y, yaw_rad) of the vehicle in CARLA world (yaw is CARLA's).
+    If `wz` is omitted, points are taken at the vehicle origin height so a
+    yaw-only pose matches the old planar transform.
     """
-    ex, ey, eyaw = ego_xy_yaw
-    dx = np.asarray(wx, dtype=np.float64) - ex
-    dy = np.asarray(wy, dtype=np.float64) - ey
-    c, s = math.cos(eyaw), math.sin(eyaw)
-    x_veh = c * dx + s * dy
-    y_veh = -s * dx + c * dy  # CARLA Y-right
-    return x_veh, -y_veh
+    wx = np.asarray(wx, dtype=np.float64)
+    wy = np.asarray(wy, dtype=np.float64)
+    shape = wx.shape
+    if hasattr(pose, "get_inverse_matrix"):
+        if wz is None:
+            loc = pose.location
+            wz = np.full(wx.shape, float(loc.z), dtype=np.float64)
+        else:
+            wz = np.broadcast_to(np.asarray(wz, dtype=np.float64), wx.shape)
+        hom = np.stack([
+            wx.reshape(-1), wy.reshape(-1), np.asarray(wz, dtype=np.float64).reshape(-1),
+            np.ones(wx.size, dtype=np.float64),
+        ], axis=0)
+        veh = np.array(pose.get_inverse_matrix(), dtype=np.float64) @ hom
+        return veh[0].reshape(shape), (-veh[1]).reshape(shape)
+
+    t, R = _as_se3_pose(pose)
+    if wz is None:
+        wz = np.full_like(wx, t[2])
+    else:
+        wz = np.broadcast_to(np.asarray(wz, dtype=np.float64), np.shape(wx))
+    pts = np.stack([wx, wy, np.asarray(wz, dtype=np.float64)], axis=0).reshape(3, -1)
+    veh = R.T @ (pts - t.reshape(3, 1))
+    return veh[0].reshape(shape), (-veh[1]).reshape(shape)
 
 
 def yaw_world_to_ego(yaw_world: np.ndarray | float, ego_yaw_world: float) -> np.ndarray | float:
@@ -40,20 +114,53 @@ def yaw_world_to_ego(yaw_world: np.ndarray | float, ego_yaw_world: float) -> np.
     return wrap_angle(-(np.asarray(yaw_world, dtype=np.float64) - ego_yaw_world))
 
 
+def world_heading_to_ego(
+    wyaw: np.ndarray,
+    pose,
+    wpitch: np.ndarray | float | None = None,
+    wroll: np.ndarray | float | None = None,
+) -> np.ndarray:
+    """Waypoint heading → ego yaw by rotating the forward axis through SE(3)."""
+    wyaw = np.asarray(wyaw, dtype=np.float64).reshape(-1)
+    n = int(wyaw.size)
+    if n == 0:
+        return wyaw
+    if wpitch is None:
+        wpitch = np.zeros(n, dtype=np.float64)
+    if wroll is None:
+        wroll = np.zeros(n, dtype=np.float64)
+    wpitch = np.broadcast_to(np.asarray(wpitch, dtype=np.float64).reshape(-1), (n,))
+    wroll = np.broadcast_to(np.asarray(wroll, dtype=np.float64).reshape(-1), (n,))
+    if hasattr(pose, "get_inverse_matrix"):
+        R_vw = np.array(pose.get_inverse_matrix(), dtype=np.float64)[:3, :3]
+    else:
+        _t, R_v = _as_se3_pose(pose)
+        R_vw = R_v.T
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        fwd_w = carla_rotation_matrix(float(wpitch[i]), float(wyaw[i]), float(wroll[i]))[:, 0]
+        fwd_v = R_vw @ fwd_w
+        out[i] = math.atan2(-fwd_v[1], fwd_v[0])
+    return wrap_angle(out)
+
+
 def ego_bev_to_world(
     x: np.ndarray | float,
     y: np.ndarray | float,
-    ego_xy_yaw: tuple[float, float, float],
+    pose,
+    z: np.ndarray | float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Ego BEV XY (Y left) → CARLA world XY."""
-    ex, ey, eyaw = ego_xy_yaw
+    """Ego BEV XY (Y left) → CARLA world XY via the vehicle SE(3) pose."""
+    t, R = _as_se3_pose(pose)
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-    x_veh, y_veh = x, -y
-    c, s = math.cos(eyaw), math.sin(eyaw)
-    wx = ex + c * x_veh - s * y_veh
-    wy = ey + s * x_veh + c * y_veh
-    return wx, wy
+    if z is None:
+        z = np.zeros_like(x, dtype=np.float64)
+    else:
+        z = np.broadcast_to(np.asarray(z, dtype=np.float64), np.shape(x))
+    veh = np.stack([x, -np.asarray(y, dtype=np.float64), np.asarray(z, dtype=np.float64)], axis=0).reshape(3, -1)
+    world = (R @ veh) + t.reshape(3, 1)
+    return world[0].reshape(x.shape), world[1].reshape(x.shape)
 
 
 def ego_yaw_to_world(psi_ego: np.ndarray | float, ego_yaw_world: float) -> np.ndarray | float:
@@ -81,6 +188,69 @@ def transform_states_between_ego(
     out = arr.copy()
     out[0], out[1], out[2] = np.asarray(x), np.asarray(y), np.asarray(psi)
     return out.T if transpose else out
+
+
+def remaining_route_index(
+    wx: np.ndarray,
+    wy: np.ndarray,
+    pose,
+    behind_slack_m: float = 0.0,
+    wz: np.ndarray | float | None = None,
+) -> int:
+    """
+    Start index of the still-active route.
+
+    Closest waypoint, then skip any that sit behind the vehicle. A heading
+    change must not revive already-passed waypoints that have merely rotated
+    into x > 0.
+    """
+    wx = np.asarray(wx, dtype=np.float64).reshape(-1)
+    wy = np.asarray(wy, dtype=np.float64).reshape(-1)
+    if wx.size == 0:
+        return 0
+    x, y = world_to_ego_bev(wx, wy, pose, wz=wz)
+    i0 = int(np.argmin(x * x + y * y))
+    n = int(x.size)
+    while i0 < n - 1 and float(x[i0]) < -behind_slack_m:
+        i0 += 1
+    return i0
+
+
+def route_world_to_ego(
+    wx: np.ndarray,
+    wy: np.ndarray,
+    wyaw: np.ndarray,
+    pose,
+    wz: np.ndarray | float | None = None,
+    wpitch: np.ndarray | float | None = None,
+    wroll: np.ndarray | float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remaining global route in ego BEV XY / yaw, starting at the vehicle."""
+    wx = np.asarray(wx, dtype=np.float64).reshape(-1)
+    wy = np.asarray(wy, dtype=np.float64).reshape(-1)
+    wyaw = np.asarray(wyaw, dtype=np.float64).reshape(-1)
+    if wx.size == 0:
+        return np.zeros((1, 2)), np.zeros(1)
+    if wz is not None:
+        wz = np.asarray(wz, dtype=np.float64).reshape(-1)
+    i0 = remaining_route_index(wx, wy, pose, wz=wz)
+    wx, wy, wyaw = wx[i0:], wy[i0:], wyaw[i0:]
+    if wz is not None:
+        wz = wz[i0:]
+    if wpitch is not None:
+        wpitch = np.asarray(wpitch, dtype=np.float64).reshape(-1)[i0:]
+    if wroll is not None:
+        wroll = np.asarray(wroll, dtype=np.float64).reshape(-1)[i0:]
+    x, y = world_to_ego_bev(wx, wy, pose, wz=wz)
+    xy = np.stack([x, y], axis=1)
+    yaw = world_heading_to_ego(wyaw, pose, wpitch=wpitch, wroll=wroll)
+    if xy.shape[0] == 0 or float(np.hypot(xy[0, 0], xy[0, 1])) > 0.15:
+        xy = np.vstack([np.zeros((1, 2)), xy])
+        yaw = np.concatenate([np.zeros(1), yaw])
+    else:
+        xy[0] = (0.0, 0.0)
+        yaw[0] = 0.0
+    return xy, yaw
 
 
 def _cum_arclength(xy: np.ndarray) -> np.ndarray:
@@ -222,22 +392,24 @@ class GlobalTarget:
         return float(s[-1]) if s.size else 0.0
 
     def route_in_ego(self) -> tuple[np.ndarray, np.ndarray]:
-        """Current global route as ego-frame XY and yaw."""
+        """Current remaining global route as ego-frame XY and yaw."""
         tf = self.vehicle.get_transform()
-        ego = (tf.location.x, tf.location.y, math.radians(tf.rotation.yaw))
         if not self._route:
             return np.zeros((1, 2)), np.zeros(1)
         wx = np.array([wp.transform.location.x for wp, _ in self._route], dtype=np.float64)
         wy = np.array([wp.transform.location.y for wp, _ in self._route], dtype=np.float64)
+        wz = np.array([wp.transform.location.z for wp, _ in self._route], dtype=np.float64)
         wyaw = np.radians([wp.transform.rotation.yaw for wp, _ in self._route])
-        ex, ey = world_to_ego_bev(wx, wy, ego)
-        xy = np.stack([ex, ey], axis=1)
-        yaw = np.array([yaw_world_to_ego(w, ego[2]) for w in wyaw], dtype=np.float64)
-        # drop points well behind the vehicle
-        ahead = xy[:, 0] > -2.0
-        if ahead.sum() >= 2:
-            xy, yaw = xy[ahead], yaw[ahead]
-        return xy, yaw
+        wpitch = np.radians([wp.transform.rotation.pitch for wp, _ in self._route])
+        wroll = np.radians([wp.transform.rotation.roll for wp, _ in self._route])
+        i0 = remaining_route_index(wx, wy, tf, wz=wz)
+        if i0:
+            self._route = self._route[i0:]
+            wx, wy, wz = wx[i0:], wy[i0:], wz[i0:]
+            wyaw, wpitch, wroll = wyaw[i0:], wpitch[i0:], wroll[i0:]
+        return route_world_to_ego(
+            wx, wy, wyaw, tf, wz=wz, wpitch=wpitch, wroll=wroll,
+        )
 
     def update(self, speed: float, n_knots: int) -> dict:
         if self._remaining_arclength() < self.replan_remaining_m:

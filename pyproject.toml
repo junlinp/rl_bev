@@ -23,6 +23,7 @@ carla = [
 ]
 nmpc = [
     "casadi",
+    "rerun-sdk",
 ]
 
 [tool.uv]
