@@ -71,3 +71,23 @@ def ego_from_camera(
     T[1, 3] = -mount[1]  # vehicle Y-right → ego Y-left
     T[2, 3] = mount[2]
     return T
+
+
+def camera_origin_xy(cam_extrinsic: np.ndarray) -> tuple[float, float]:
+    """Left-camera XY in vehicle-center FLU (occupancy origin is the car)."""
+    t = np.asarray(cam_extrinsic, dtype=np.float64)
+    return float(t[0, 3]), float(t[1, 3])
+
+
+def vehicle_to_occupancy(points: np.ndarray, origin_xy: tuple[float, float]) -> np.ndarray:
+    """Shift vehicle-center FLU into a frame whose XY origin is ``origin_xy``."""
+    out = np.asarray(points, dtype=np.float64).copy()
+    ox, oy = float(origin_xy[0]), float(origin_xy[1])
+    if out.ndim == 1:
+        out[0] -= ox
+        if out.shape[0] > 1:
+            out[1] -= oy
+        return out
+    out[..., 0] -= ox
+    out[..., 1] -= oy
+    return out

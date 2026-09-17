@@ -237,6 +237,7 @@ if HAS_TORCH:
             pts_cam = torch.stack([X, Y, Z], dim=1).reshape(B, 3, -1)
             ego = torch.bmm(cam_ext[:, :3, :3], pts_cam) + cam_ext[:, :3, 3].unsqueeze(-1)
             ego = ego.reshape(B, 3, D, Hf, Wf)
+            # Occupancy origin = vehicle center (same as geometric lift).
             ego_x, ego_y, ego_z = ego[:, 0], ego[:, 1], ego[:, 2]
 
             gi = ((ego_x - self.bev_x_range[0]) / self.bev_voxel).long()

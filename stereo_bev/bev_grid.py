@@ -2,7 +2,7 @@
 
 import numpy as np
 
-# Local 3D occupancy volume (ego frame: X forward, Y left, Z up)
+# Local 3D occupancy volume (vehicle-center FLU: X forward, Y left, Z up)
 DEFAULT_X_RANGE = (0.0, 20.0)
 DEFAULT_Y_RANGE = (-10.0, 10.0)
 DEFAULT_Z_RANGE = (-1.0, 3.0)
@@ -18,12 +18,14 @@ def occupancy_to_bev(occ: np.ndarray) -> np.ndarray:
 
 class BEVGrid:
     """
-    Axis-aligned BEV grid in the ego (vehicle) frame.
+    Axis-aligned BEV grid in vehicle-center ego FLU.
 
     Coordinate convention (right-hand, Z-up):
-        X  → forward
+        X  → forward (vehicle heading, origin at the CARLA actor / car center)
         Y  → left
-        Z  → up
+        Z  → up (height above ground)
+
+    The left camera sits about +1.5 m in X from this origin.
 
     BEV cell (i, j) corresponds to:
         x = x_range[0] + (i + 0.5) * voxel_size
