@@ -33,7 +33,8 @@ def draw_bev_map(
     img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
 
     if mark_center:
-        cx, cy = w * scale // 2, h * scale // 2
+        # Vehicle / occupancy origin (x=0, y=0): left edge, vertical mid.
+        cx, cy = int(0.5 * scale), h * scale // 2
         cv2.drawMarker(img, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 12, 1)
 
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -178,7 +179,10 @@ def _draw_xy_path(img, xy, to_px, color, thickness=2):
             _polyline(img, seg, color, thickness)
         seg.clear()
 
-    for x, y in xy:
+    pts = np.asarray(xy, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        return
+    for x, y in pts[:, :2]:
         c, r = to_px(float(x), float(y))
         if 0 <= c < w and 0 <= r < h:
             seg.append((c, r))
