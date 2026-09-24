@@ -4,6 +4,8 @@ Collect stereo RGB + BEV ground truth from CARLA with nearby obstacles.
 Spawns NPC traffic near the ego vehicle to ensure objects appear
 within the 10m×10m×5m BEV grid.
 
+Samples are stored only in minikeyvalue (default http://localhost:3000).
+
 Usage:
   python collect_data.py --samples 500 --val-ratio 0.2
 """
@@ -29,6 +31,8 @@ from stereo_bev.bev_grid import (
 from stereo_bev.query_heads import GeometricSegHead, GeometricOccHead
 from stereo_bev.calibration import DEFAULT_PITCH_DEG
 from minikeyvalue_client import MiniKV
+
+DEFAULT_KV_URL = "http://localhost:3000"
 
 
 def spawn_npc_traffic(world, tm, ego_vehicle, num_vehicles=15, num_walkers=10):
@@ -106,7 +110,6 @@ def collect(
     host: str = "localhost",
     port: int = 2000,
     num_samples: int = 500,
-    output_dir: str = "bev_data",
     val_ratio: float = 0.2,
     image_w: int = 960,
     image_h: int = 540,
@@ -124,30 +127,24 @@ def collect(
     num_walkers: int = 10,
     min_occupied: int = 50,  # min occupied cells to keep a sample
     min_classes: int = 2,    # min distinct BEV classes to keep a sample
-    kv_url: str = None,      # minikeyvalue URL (e.g. http://localhost:3000)
+    kv_url: str = DEFAULT_KV_URL,
 ):
-    kv = MiniKV(kv_url) if kv_url else None
+    if not kv_url:
+        raise ValueError("kv_url is required; collect_data writes only to minikeyvalue")
+    kv = MiniKV(kv_url)
 
-    if kv:
-        # resume from existing counts in minikeyvalue
-        existing_train = kv.count("/train/")
-        existing_val = kv.count("/val/")
-        train_count = existing_train
-        val_count = existing_val
-        print(f"[Collect] minikeyvalue mode: {kv_url}")
-        print(f"[Collect] Existing: {existing_train} train + {existing_val} val")
-    else:
-        train_dir = os.path.join(output_dir, "train")
-        val_dir = os.path.join(output_dir, "val")
-        os.makedirs(train_dir, exist_ok=True)
-        os.makedirs(val_dir, exist_ok=True)
+    # resume from existing counts in minikeyvalue
+    existing_train = kv.count("/train/")
+    existing_val = kv.count("/val/")
+    train_count = existing_train
+    val_count = existing_val
+    print(f"[Collect] minikeyvalue: {kv_url}")
+    print(f"[Collect] Existing: {existing_train} train + {existing_val} val")
 
     num_val = int(num_samples * val_ratio)
     num_train = num_samples - num_val
 
     print(f"[Collect] Target: {num_train} train + {num_val} val = {num_samples} total")
-    if not kv:
-        print(f"[Collect] Output: {output_dir}/")
     print(f"[Collect] Filtering: min_occupied={min_occupied}, min_classes={min_classes}")
 
     client = carla.Client(host, port)
@@ -242,52 +239,30 @@ def collect(
             for c in range(NUM_BEV_CLASSES):
                 class_stats[c] += (seg_gt == c).sum()
 
-            # save
-            if kv:
-                if collected < num_train:
-                    key = f"/train/sample_{train_count:06d}"
-                    train_count += 1
-                else:
-                    key = f"/val/sample_{val_count:06d}"
-                    val_count += 1
-                buf = io.BytesIO()
-                np.savez_compressed(
-                    buf,
-                    left_rgb=data["left_rgb"],
-                    right_rgb=data["right_rgb"],
-                    depth_gt=depth,
-                    seg_gt=seg_gt,
-                    occ_gt=occ_gt,
-                    bev_seg_gt=bev_seg_gt,
-                    K=rig.K,
-                    cam_ext=cam_ext,
-                    x_range=np.array(bev_x_range, dtype=np.float32),
-                    y_range=np.array(bev_y_range, dtype=np.float32),
-                    z_range=np.array(bev_z_range, dtype=np.float32),
-                    voxel_size=np.float32(bev_voxel),
-                )
-                kv.put(key, buf.getvalue())
+            if collected < num_train:
+                key = f"/train/sample_{train_count:06d}"
+                train_count += 1
             else:
-                if collected < num_train:
-                    out_path = os.path.join(train_dir, f"sample_{collected:06d}.npz")
-                else:
-                    val_idx = collected - num_train
-                    out_path = os.path.join(val_dir, f"sample_{val_idx:06d}.npz")
-                np.savez_compressed(
-                    out_path,
-                    left_rgb=data["left_rgb"],
-                    right_rgb=data["right_rgb"],
-                    depth_gt=depth,
-                    seg_gt=seg_gt,
-                    occ_gt=occ_gt,
-                    bev_seg_gt=bev_seg_gt,
-                    K=rig.K,
-                    cam_ext=cam_ext,
-                    x_range=np.array(bev_x_range, dtype=np.float32),
-                    y_range=np.array(bev_y_range, dtype=np.float32),
-                    z_range=np.array(bev_z_range, dtype=np.float32),
-                    voxel_size=np.float32(bev_voxel),
-                )
+                key = f"/val/sample_{val_count:06d}"
+                val_count += 1
+            buf = io.BytesIO()
+            np.savez_compressed(
+                buf,
+                left_rgb=data["left_rgb"],
+                right_rgb=data["right_rgb"],
+                depth_gt=depth,
+                seg_gt=seg_gt,
+                occ_gt=occ_gt,
+                bev_seg_gt=bev_seg_gt,
+                K=rig.K,
+                cam_ext=cam_ext,
+                x_range=np.array(bev_x_range, dtype=np.float32),
+                y_range=np.array(bev_y_range, dtype=np.float32),
+                z_range=np.array(bev_z_range, dtype=np.float32),
+                voxel_size=np.float32(bev_voxel),
+            )
+            if not kv.put(key, buf.getvalue()):
+                raise OSError(f"PUT {key} failed on {kv_url}")
 
             collected += 1
             split = "train" if collected <= num_train else "val"
@@ -333,12 +308,8 @@ def collect(
 
     # summary
     print(f"\n[Collect] Done. {collected} saved, {skipped} skipped.")
-    if kv:
-        print(f"  Train: {kv.count('/train/')} → {kv_url}/train/")
-        print(f"  Val:   {kv.count('/val/')} → {kv_url}/val/")
-    else:
-        print(f"  Train: {min(collected, num_train)} → {train_dir}/")
-        print(f"  Val:   {max(0, collected - num_train)} → {val_dir}/")
+    print(f"  Train: {kv.count('/train/')} → {kv_url}/train/")
+    print(f"  Val:   {kv.count('/val/')} → {kv_url}/val/")
     print(f"\n  BEV class distribution:")
     total_px = class_stats.sum()
     for c in range(NUM_BEV_CLASSES):
@@ -352,19 +323,18 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=2000)
     parser.add_argument("--samples", type=int, default=500)
-    parser.add_argument("--output", default="bev_data")
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--steps-per-sample", type=int, default=3)
     parser.add_argument("--num-vehicles", type=int, default=15)
     parser.add_argument("--num-walkers", type=int, default=10)
     parser.add_argument("--min-occupied", type=int, default=50)
     parser.add_argument("--min-classes", type=int, default=2)
-    parser.add_argument("--kv-url", default=None, help="minikeyvalue URL (e.g. http://localhost:3000)")
+    parser.add_argument("--kv-url", default=DEFAULT_KV_URL, help="minikeyvalue URL")
     args = parser.parse_args()
 
     collect(
         host=args.host, port=args.port,
-        num_samples=args.samples, output_dir=args.output,
+        num_samples=args.samples,
         val_ratio=args.val_ratio, steps_per_sample=args.steps_per_sample,
         num_vehicles=args.num_vehicles, num_walkers=args.num_walkers,
         min_occupied=args.min_occupied, min_classes=args.min_classes,
