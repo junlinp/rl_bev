@@ -4,6 +4,7 @@ import carla
 import cv2
 import numpy as np
 import time
+import math
 
 from .camera_rig import CameraRig
 from .depth import decode_carla_depth
@@ -12,6 +13,7 @@ from .bev_grid import BEVGrid, occupancy_to_bev, DEFAULT_X_RANGE, DEFAULT_Y_RANG
 from .query_heads import GeometricOccHead, HAS_TORCH
 from .visualize import draw_bev_map, draw_legend, draw_depth_heatmap, draw_occ_3d_projections
 from .calibration import DEFAULT_PITCH_DEG
+from .occ_fusion import TemporalOccFusion
 
 
 def run(
@@ -31,6 +33,7 @@ def run(
     pitch_deg: float = DEFAULT_PITCH_DEG,
     mode: str = "geometric",     # "geometric" or "model"
     model_checkpoint: str | None = None,
+    use_occ_fusion: bool = True,
 ):
     """
     Full BEV perception loop.
@@ -104,11 +107,23 @@ def run(
     else:
         occ_head_geo = GeometricOccHead(min_hits=2.0)
 
+    occ_fusion = None
+    if use_occ_fusion:
+        occ_thresh = 2.0 if mode != "model" else 0.25
+        occ_fusion = TemporalOccFusion(bev, occ_thresh=occ_thresh)
+
     cam_extrinsic = rig.cam_extrinsic
 
     print(f"[BEV] Mode: {mode}")
     print(f"[BEV] Occupancy: {bev.grid_z}x{bev.grid_h}x{bev.grid_w} voxels, voxel={bev_voxel}m, pitch={pitch_deg}°")
     print(f"[BEV] Camera: {image_w}x{image_h}, fov={fov}°, baseline={baseline}m")
+    if occ_fusion is not None:
+        print(
+            f"[BEV] temporal occupancy fusion  decay={occ_fusion.decay:.2f}  "
+            f"thresh={occ_fusion.occ_thresh:.2f}"
+        )
+    else:
+        print("[BEV] temporal occupancy fusion  off")
     print(f"[BEV] Press 'q' to quit")
 
     # ── main loop ──
@@ -124,15 +139,26 @@ def run(
 
             left_rgb = data["left_rgb"]
             right_rgb = data["right_rgb"]
+            tf = vehicle.get_transform()
+            ego_xy_yaw = (
+                float(tf.location.x), float(tf.location.y),
+                math.radians(tf.rotation.yaw),
+            )
 
             # ── BEV prediction ──
+            voxel_class = None
             if model is not None:
                 # model mode: stereo RGB → BEV
-                _, occ_map, bev_classes, _ = model.infer(
+                _, occ_map, bev_classes, _, _ = model.infer(
                     left_rgb, right_rgb, rig.K, device=device, cam_ext=cam_extrinsic,
                 )
                 # decode depth for visualization only
                 depth = decode_carla_depth(data["depth_raw"])
+                occ_map = np.asarray(occ_map).astype(np.uint8)
+                if occ_fusion is not None:
+                    occ_map, voxel_class = occ_fusion.update(
+                        occ_map, voxel_class, ego_xy_yaw,
+                    )
             else:
                 # geometric mode: depth + seg sensors → BEV
                 depth = decode_carla_depth(data["depth_raw"])
@@ -146,7 +172,14 @@ def run(
                     max_depth=max_depth,
                 )
                 bev_classes = bev.get_bev_semantic(bev_result["class_histogram"])
-                occ_map = occ_head_geo(bev_result["occupancy_count"])
+                if occ_fusion is not None:
+                    occ_map, voxel_class = occ_fusion.update(
+                        bev_result["occupancy_count"],
+                        bev_result["voxel_class"],
+                        ego_xy_yaw,
+                    )
+                else:
+                    occ_map = occ_head_geo(bev_result["occupancy_count"])
 
             # ── visualization ──
             bev_img = draw_bev_map(bev_classes, occ_map, scale=4)
@@ -206,3 +239,23 @@ def run(
         tm.set_synchronous_mode(False)
         cv2.destroyAllWindows()
         print("[BEV] Done.")
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(description="Stereo BEV perception in CARLA")
+    p.add_argument("--host", default="localhost")
+    p.add_argument("--port", type=int, default=2000)
+    p.add_argument("--duration", type=float, default=60.0)
+    p.add_argument("--mode", default="geometric", choices=["geometric", "model"])
+    p.add_argument("--model-checkpoint", default=None)
+    p.add_argument(
+        "--no-occ-fusion", action="store_true",
+        help="Disable multi-frame occupancy merge (single-frame lift only)",
+    )
+    args = p.parse_args()
+    run(
+        host=args.host, port=args.port, duration_sec=args.duration,
+        mode=args.mode, model_checkpoint=args.model_checkpoint,
+        use_occ_fusion=not args.no_occ_fusion,
+    )

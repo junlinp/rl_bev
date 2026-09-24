@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from .segmentation import BEV_COLORS, NUM_BEV_CLASSES, BEV_CLASSES
-from .bev_grid import occupancy_to_bev
+from .bev_grid import occupancy_to_bev, DEFAULT_X_RANGE, DEFAULT_Y_RANGE, DEFAULT_Z_RANGE
 
 
 def draw_bev_map(
@@ -33,8 +33,8 @@ def draw_bev_map(
     img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
 
     if mark_center:
-        # Vehicle / occupancy origin (x=0, y=0): left edge, vertical mid.
-        cx, cy = int(0.5 * scale), h * scale // 2
+        # Vehicle / occupancy origin (x=0, y=0): image center on a symmetric grid.
+        cx, cy = w * scale // 2, h * scale // 2
         cv2.drawMarker(img, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 12, 1)
 
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -77,9 +77,9 @@ def _scale_nearest(img: np.ndarray, scale: int) -> np.ndarray:
 def draw_occ_3d_projections(
     occ: np.ndarray,
     scale: int = 4,
-    x_range: tuple[float, float] = (0.0, 20.0),
-    y_range: tuple[float, float] = (-10.0, 10.0),
-    z_range: tuple[float, float] = (-1.0, 3.0),
+    x_range: tuple[float, float] = DEFAULT_X_RANGE,
+    y_range: tuple[float, float] = DEFAULT_Y_RANGE,
+    z_range: tuple[float, float] = DEFAULT_Z_RANGE,
 ) -> np.ndarray:
     """
     Orthographic views of a 3D occupancy volume.
@@ -117,7 +117,7 @@ def draw_occ_3d_projections(
         cv2.putText(img, text, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         return img
 
-    xy = label(xy, f"BEV XY  z by height  {x_range[0]:.0f}..{x_range[1]:.0f}m fwd")
+    xy = label(xy, f"BEV XY  z by height  {x_range[0]:.0f}..{x_range[1]:.0f}m")
     xz = label(xz, f"side XZ  x {x_range[0]:.0f}..{x_range[1]:.0f}  z {z_range[0]:.0f}..{z_range[1]:.0f}")
     yz = label(yz, f"front YZ  y {y_range[0]:.0f}..{y_range[1]:.0f}  z {z_range[0]:.0f}..{z_range[1]:.0f}")
 
@@ -200,7 +200,7 @@ def draw_planning_on_bev(
     target_xy: np.ndarray | None = None,
     ref_xy: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Overlay route (cyan), NMPC traj (yellow), 5 s target (red), ego (white)."""
+    """Overlay route (cyan), optional traj (yellow), 5 s target (red), ego (white)."""
     out = bev_img.copy()
     h, w = out.shape[:2]
 
@@ -229,9 +229,9 @@ def draw_occ_3d_with_sweep(
     ref_xy: np.ndarray | None = None,
     grid=None,
     scale: int = 3,
-    x_range: tuple[float, float] = (0.0, 20.0),
-    y_range: tuple[float, float] = (-10.0, 10.0),
-    z_range: tuple[float, float] = (-1.0, 3.0),
+    x_range: tuple[float, float] = DEFAULT_X_RANGE,
+    y_range: tuple[float, float] = DEFAULT_Y_RANGE,
+    z_range: tuple[float, float] = DEFAULT_Z_RANGE,
 ) -> np.ndarray:
     """3D occupancy projections with optional body-sweep tint and path overlay."""
     occ_u8 = (np.asarray(occ) > 0).astype(np.uint8)
@@ -343,4 +343,51 @@ def draw_control_curves(
         (width - 44, height - 2),
         cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 160), 1, cv2.LINE_AA,
     )
+    return img
+
+
+def draw_va_control(
+    control,
+    width: int = 640,
+    height: int = 140,
+) -> np.ndarray:
+    """Horizontal bars for CARLA throttle / brake / steer."""
+    img = np.full((height, width, 3), 18, dtype=np.uint8)
+    t, b, s = 0.0, 0.0, 0.0
+    if control is not None:
+        arr = np.asarray(control, dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            t, b, s = float(arr[0]), float(arr[1]), float(arr[2])
+    rows = (
+        ("throttle", t, (80, 220, 80)),
+        ("brake", b, (60, 60, 220)),
+        ("steer", s, (0, 165, 255)),
+    )
+    cv2.putText(
+        img, "control  throttle / brake / steer",
+        (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA,
+    )
+    margin_l, margin_r = 88, 16
+    bar_h = 22
+    y0 = 32
+    for i, (name, val, color) in enumerate(rows):
+        y = y0 + i * (bar_h + 10)
+        x0 = margin_l
+        x1 = width - margin_r
+        mid = (x0 + x1) // 2
+        cv2.rectangle(img, (x0, y), (x1, y + bar_h), (36, 36, 36), -1)
+        cv2.line(img, (mid, y), (mid, y + bar_h), (70, 70, 70), 1)
+        if name == "steer":
+            span = max((x1 - x0) // 2, 1)
+            px = int(np.clip(mid + val * span, x0, x1))
+            x_a, x_b = (mid, px) if px >= mid else (px, mid)
+            cv2.rectangle(img, (x_a, y + 3), (x_b, y + bar_h - 3), color, -1)
+        else:
+            frac = float(np.clip(val, 0.0, 1.0))
+            px = int(x0 + frac * (x1 - x0))
+            cv2.rectangle(img, (x0, y + 3), (max(px, x0 + 1), y + bar_h - 3), color, -1)
+        cv2.putText(
+            img, f"{name} {val:+.2f}",
+            (8, y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA,
+        )
     return img

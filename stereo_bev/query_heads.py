@@ -1,19 +1,23 @@
 """
-Stereo-to-BEV perception model.
+Stereo vision-action model.
 
 Architecture:
   1. Shared backbone extracts features from left + right RGB
   2. Depth predictor: stereo features → per-pixel depth distribution
   3. Seg head: left features → per-pixel semantic segmentation (IMAGE SPACE)
-  4. LSS lifter: lift features using predicted depth + seg → BEV grid
-  5. Occ head: BEV features → per-cell occupancy
+  4. LSS lifter: lift features using predicted depth + K + extrinsics → 3D BEV
+  5. Occ / BEV-seg heads query the BEV volume
+  6. Control head: BEV queries at ego + target pose → CARLA (throttle, brake, steer)
 
 Key: segmentation is in image space (camera view), NOT BEV projection.
 Ground truth seg comes from CARLA's semantic segmentation camera directly.
 Occupancy ground truth is a 3D voxel volume lifted from depth+seg.
+Expert control labels come from CARLA autopilot at collect time.
 """
 
 import numpy as np
+
+from .bev_grid import DEFAULT_X_RANGE, DEFAULT_Y_RANGE, DEFAULT_Z_RANGE, DEFAULT_VOXEL
 
 try:
     import torch
@@ -183,8 +187,8 @@ if HAS_TORCH:
     class LSSLifter(nn.Module):
         """Lift 2D features to BEV using predicted depth distribution."""
         def __init__(self, feat_channels, depth_bins=64, image_h=540, image_w=960,
-                     bev_x_range=(0.0, 20.0), bev_y_range=(-10.0, 10.0),
-                     bev_z_range=(-1.0, 3.0), bev_voxel=0.2, max_depth=80.0):
+                     bev_x_range=DEFAULT_X_RANGE, bev_y_range=DEFAULT_Y_RANGE,
+                     bev_z_range=DEFAULT_Z_RANGE, bev_voxel=DEFAULT_VOXEL, max_depth=80.0):
             super().__init__()
             self.feat_channels = feat_channels
             self.depth_bins = depth_bins
@@ -237,7 +241,8 @@ if HAS_TORCH:
             pts_cam = torch.stack([X, Y, Z], dim=1).reshape(B, 3, -1)
             ego = torch.bmm(cam_ext[:, :3, :3], pts_cam) + cam_ext[:, :3, 3].unsqueeze(-1)
             ego = ego.reshape(B, 3, D, Hf, Wf)
-            # Occupancy origin = vehicle center (same as geometric lift).
+            # Occupancy origin = vehicle center: default voxel (50, 50, 5).
+            # Camera is at ~+1.5 m X in this same grid (xi ≈ 57).
             ego_x, ego_y, ego_z = ego[:, 0], ego[:, 1], ego[:, 2]
 
             gi = ((ego_x - self.bev_x_range[0]) / self.bev_voxel).long()
@@ -289,33 +294,214 @@ if HAS_TORCH:
         def forward(self, x): return self.head(x)
 
     class BevSegQueryHead(nn.Module):
-        """BEV semantics: (B, C, H, W) → (B, num_classes, H, W) logits (per-cell class)."""
-        def __init__(self, in_ch, num_classes):
+        """BEV features → per-voxel class logits (B, num_classes, Z, H, W)."""
+        def __init__(self, in_ch, num_classes, grid_z: int):
             super().__init__()
+            self.num_classes = num_classes
+            self.grid_z = grid_z
             self.head = nn.Sequential(
                 nn.Conv2d(in_ch, 64, 3, padding=1, bias=False),
                 nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-                nn.Conv2d(64, num_classes, 1),
+                nn.Conv2d(64, num_classes * grid_z, 1),
             )
-        def forward(self, x): return self.head(x)
+        def forward(self, x):
+            y = self.head(x)
+            b, _, h, w = y.shape
+            return y.view(b, self.num_classes, self.grid_z, h, w)
+
+    class ControlQueryHead(nn.Module):
+        """Query 3D BEV at ego and the target pose, then emit CARLA control.
+
+        BEV tensor layout is (B, C, H=y, W=x). Occupancy is (B, Z, H, W).
+        ``target`` is (B, 4): ego-FLU x, y, yaw (rad), speed (m/s).
+        Output is (B, 3): throttle, brake in [0, 1], steer in [-1, 1].
+        """
+
+        def __init__(self, in_ch, grid_z: int, x_range, y_range, v_scale: float = 15.0):
+            super().__init__()
+            self.v_scale = float(v_scale)
+            self.register_buffer(
+                "x_range", torch.tensor([float(x_range[0]), float(x_range[1])]),
+            )
+            self.register_buffer(
+                "y_range", torch.tensor([float(y_range[0]), float(y_range[1])]),
+            )
+            occ_dim = 16
+            self.occ_proj = nn.Sequential(
+                nn.Linear(grid_z, occ_dim),
+                nn.ReLU(inplace=True),
+            )
+            pose_dim = 5
+            hid = 256
+            mlp_in = in_ch * 3 + occ_dim * 2 + pose_dim
+            self.feat_dim = mlp_in
+            self.mlp = nn.Sequential(
+                nn.Linear(mlp_in, hid),
+                nn.ReLU(inplace=True),
+                nn.Linear(hid, hid),
+                nn.ReLU(inplace=True),
+                nn.Linear(hid, 3),
+            )
+            self.critic = nn.Sequential(
+                nn.Linear(mlp_in, hid),
+                nn.ReLU(inplace=True),
+                nn.Linear(hid, 1),
+            )
+            self.log_std = nn.Parameter(torch.zeros(3))
+
+        def _xy_grid(self, xy: torch.Tensor) -> torch.Tensor:
+            x0, x1 = self.x_range[0], self.x_range[1]
+            y0, y1 = self.y_range[0], self.y_range[1]
+            gx = 2.0 * (xy[:, 0] - x0) / (x1 - x0).clamp_min(1e-6) - 1.0
+            gy = 2.0 * (xy[:, 1] - y0) / (y1 - y0).clamp_min(1e-6) - 1.0
+            return torch.stack([gx, gy], dim=-1).view(-1, 1, 1, 2)
+
+        def _sample(self, feat: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
+            grid = self._xy_grid(xy).to(dtype=feat.dtype)
+            return F.grid_sample(
+                feat, grid, mode="bilinear", padding_mode="zeros", align_corners=False,
+            ).squeeze(-1).squeeze(-1)
+
+        def _sample_many(self, feat: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
+            """xy (B, P, 2) → (B, P, C)."""
+            x0, x1 = self.x_range[0], self.x_range[1]
+            y0, y1 = self.y_range[0], self.y_range[1]
+            gx = 2.0 * (xy[..., 0] - x0) / (x1 - x0).clamp_min(1e-6) - 1.0
+            gy = 2.0 * (xy[..., 1] - y0) / (y1 - y0).clamp_min(1e-6) - 1.0
+            grid = torch.stack([gx, gy], dim=-1).unsqueeze(2)
+            out = F.grid_sample(
+                feat, grid.to(dtype=feat.dtype),
+                mode="bilinear", padding_mode="zeros", align_corners=False,
+            )
+            return out.squeeze(-1).permute(0, 2, 1)
+
+        def encode(self, bev_feat, occ_logits, target):
+            """BEV queries + target pose → control feature (B, feat_dim)."""
+            self._occ_logits = occ_logits
+            B = bev_feat.shape[0]
+            xy_ego = bev_feat.new_zeros(B, 2)
+            xy_tgt = target[:, :2]
+            gap = F.adaptive_avg_pool2d(bev_feat, 1).flatten(1)
+            ego_f = self._sample(bev_feat, xy_ego)
+            tgt_f = self._sample(bev_feat, xy_tgt)
+            ego_o = self.occ_proj(self._sample(occ_logits, xy_ego))
+            tgt_o = self.occ_proj(self._sample(occ_logits, xy_tgt))
+            xs = target.new_tensor([2.0, 4.0, 6.0, 8.0])
+            ys = target.new_tensor([-1.5, 0.0, 1.5])
+            xx, yy = torch.meshgrid(xs, ys, indexing="ij")
+            pts = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+            xy_front = pts.unsqueeze(0).expand(B, -1, -1)
+            front_o = self.occ_proj(self._sample_many(occ_logits, xy_front)).max(dim=1).values
+            ego_o = 0.5 * ego_o + 0.5 * front_o
+            x0, x1 = self.x_range[0], self.x_range[1]
+            y0, y1 = self.y_range[0], self.y_range[1]
+            xn = 2.0 * (target[:, 0] - x0) / (x1 - x0).clamp_min(1e-6) - 1.0
+            yn = 2.0 * (target[:, 1] - y0) / (y1 - y0).clamp_min(1e-6) - 1.0
+            yaw = target[:, 2]
+            vn = target[:, 3] / max(self.v_scale, 1e-3)
+            pose = torch.stack([xn, yn, torch.cos(yaw), torch.sin(yaw), vn], dim=-1)
+            return torch.cat([gap, ego_f, tgt_f, ego_o, tgt_o, pose], dim=-1)
+
+        def _front_lanes(self, occ_logits):
+            """Occupancy in a 2–6 m, 3-lane strip, ignoring near-ground voxels."""
+            B, Z = occ_logits.shape[0], occ_logits.shape[1]
+            occ_hi = occ_logits[:, max(Z // 2, 1):]
+            xs = occ_hi.new_tensor([2.0, 4.0, 6.0])
+            ys = occ_hi.new_tensor([-1.6, 0.0, 1.6])
+            xx, yy = torch.meshgrid(xs, ys, indexing="ij")
+            pts = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+            xy = pts.unsqueeze(0).expand(B, -1, -1)
+            p = torch.sigmoid(self._sample_many(occ_hi, xy)).amax(dim=-1).view(B, 3, 3)
+            center = p[:, :, 1].amax(dim=1)
+            left = p[:, :, 2].mean(dim=1)
+            right = p[:, :, 0].mean(dim=1)
+            hazard = ((center - 0.75) / 0.25).clamp(0.0, 1.0)
+            steer_bias = torch.tanh(left - right)
+            return hazard, steer_bias
+
+        def apply_occ_safety(self, control, occ_logits):
+            """Brake / ease throttle if the front strip is occupied; nudge steer to free side."""
+            if occ_logits is None:
+                return control
+            hazard, _steer_bias = self._front_lanes(occ_logits)
+            h = hazard.unsqueeze(-1)
+            thr = control[:, 0:1] * (1.0 - 0.85 * h)
+            brk = torch.maximum(control[:, 1:2], 0.75 * h)
+            st = control[:, 2:3]
+            go = thr >= brk
+            thr = torch.where(go, thr, torch.zeros_like(thr))
+            brk = torch.where(go, torch.zeros_like(brk), brk)
+            return torch.cat([thr, brk, st], dim=-1)
+
+        def forward(self, bev_feat, occ_logits, target):
+            feat = self.encode(bev_feat, occ_logits, target)
+            return self.apply_occ_safety(squash_control(self.mlp(feat)), occ_logits)
+
+        def act_from_feat(self, feat, deterministic: bool = False, occ_logits=None):
+            """Sample CARLA control from a cached encode() vector."""
+            from torch.distributions import Normal
+            mu = self.mlp(feat)
+            value = self.critic(feat).squeeze(-1)
+            std = self.log_std.exp().clamp(1e-4, 2.0)
+            dist = Normal(mu, std)
+            z = mu if deterministic else dist.sample()
+            control = squash_control(z)
+            occ = occ_logits if occ_logits is not None else getattr(self, "_occ_logits", None)
+            control = self.apply_occ_safety(control, occ)
+            log_prob = dist.log_prob(z).sum(dim=-1) - squash_log_absdet(z)
+            entropy = dist.entropy().sum(dim=-1)
+            return control, log_prob, value, z, entropy
+
+        def evaluate_z(self, feat, z):
+            from torch.distributions import Normal
+            mu = self.mlp(feat)
+            value = self.critic(feat).squeeze(-1)
+            std = self.log_std.exp().clamp(1e-4, 2.0)
+            dist = Normal(mu, std)
+            log_prob = dist.log_prob(z).sum(dim=-1) - squash_log_absdet(z)
+            entropy = dist.entropy().sum(dim=-1)
+            return log_prob, value, entropy
+
+    def squash_control(raw: torch.Tensor) -> torch.Tensor:
+        throttle = torch.sigmoid(raw[:, 0:1])
+        brake = torch.sigmoid(raw[:, 1:2])
+        steer = torch.tanh(raw[:, 2:3])
+        # CARLA brake overrides throttle; keep only the stronger pedal.
+        go = throttle >= brake
+        throttle = torch.where(go, throttle, torch.zeros_like(throttle))
+        brake = torch.where(go, torch.zeros_like(brake), brake)
+        return torch.cat([throttle, brake, steer], dim=-1)
+
+    def squash_log_absdet(z: torch.Tensor) -> torch.Tensor:
+        s0 = torch.sigmoid(z[:, 0])
+        s1 = torch.sigmoid(z[:, 1])
+        t2 = torch.tanh(z[:, 2])
+        return (
+            torch.log(s0 * (1.0 - s0) + 1e-6)
+            + torch.log(s1 * (1.0 - s1) + 1e-6)
+            + torch.log(1.0 - t2 * t2 + 1e-6)
+        )
+
 
     # ── Full Model ──
 
     class StereoBEVModel(nn.Module):
         """
-        Stereo perception model with image-space segmentation.
+        Stereo vision-action model: RGB + K → depth / seg / 3D BEV, plus control.
 
-        Input:  left_rgb (B, 3, H, W), right_rgb (B, 3, H, W), K (B, 3, 3)
+        Input:  left_rgb (B, 3, H, W), right_rgb (B, 3, H, W), K (B, 3, 3),
+                optional target (B, 4) = (x, y, yaw, speed) in ego FLU
         Output:
             seg_logits:     (B, num_classes, H, W) — image-space segmentation
             occ_logits:     (B, grid_z, bev_h, bev_w) — 3D occupancy
-            bev_seg_logits: (B, num_classes, bev_h, bev_w) — per-cell BEV semantic class
+            bev_seg_logits: (B, num_classes, Z, bev_h, bev_w) — per-voxel class
             depth_logits:   (B, D, Hf, Wf) — depth distribution
+            control:        (B, 3) throttle, brake, steer
         """
         def __init__(self, num_classes=10, feat_channels=64, depth_bins=64,
                      image_h=540, image_w=960,
-                     bev_x_range=(0.0, 20.0), bev_y_range=(-10.0, 10.0),
-                     bev_z_range=(-1.0, 3.0), bev_voxel=0.2, max_depth=80.0,
+                     bev_x_range=DEFAULT_X_RANGE, bev_y_range=DEFAULT_Y_RANGE,
+                     bev_z_range=DEFAULT_Z_RANGE, bev_voxel=DEFAULT_VOXEL, max_depth=80.0,
                      pretrained_backbone=True, cam_extrinsic=None, pitch_deg=None):
             super().__init__()
             from .calibration import ego_from_camera, DEFAULT_PITCH_DEG
@@ -341,7 +527,11 @@ if HAS_TORCH:
             self.bev_encoder = BEVEncoder(backbone_ch, feat_channels)
             self.grid_z = self.lifter.bev_z
             self.occ_head = OccQueryHead(feat_channels, self.grid_z)
-            self.bev_seg_head = BevSegQueryHead(feat_channels, num_classes)
+            self.bev_seg_head = BevSegQueryHead(feat_channels, num_classes, self.grid_z)
+            self.control_head = ControlQueryHead(
+                feat_channels, self.grid_z,
+                x_range=bev_x_range, y_range=bev_y_range,
+            )
 
             self._image_h = image_h
             self._image_w = image_w
@@ -358,39 +548,80 @@ if HAS_TORCH:
                 cam_ext = cam_ext.unsqueeze(0).expand(batch, -1, -1)
             return cam_ext
 
-        def forward(self, left_rgb, right_rgb, K, cam_ext=None):
-            """
-            Returns:
-                seg_logits:     (B, num_classes, H, W) image-space
-                occ_logits:     (B, grid_z, bev_h, bev_w) 3D occupancy
-                bev_seg_logits: (B, num_classes, bev_h, bev_w) BEV per-cell class
-                depth_logits:   (B, D, Hf, Wf)
-            """
+        def _batch_target(self, target, batch, device, dtype):
+            if target is None:
+                return None
+            if not torch.is_tensor(target):
+                target = torch.as_tensor(target, dtype=torch.float32)
+            target = target.to(device=device, dtype=dtype)
+            if target.dim() == 1:
+                target = target.unsqueeze(0)
+            if target.shape[0] == 1 and batch > 1:
+                target = target.expand(batch, -1)
+            if target.shape[-1] < 4:
+                pad = target.new_zeros(target.shape[0], 4 - target.shape[-1])
+                target = torch.cat([target, pad], dim=-1)
+            return target[:, :4]
+
+        def encode_bev(self, left_rgb, right_rgb, K, cam_ext=None):
+            """Shared stereo → BEV encode used by perception heads and RL."""
             B = left_rgb.shape[0]
             feat_l, skips = self.backbone(left_rgb)
             feat_r, _ = self.backbone(right_rgb)
-
             stereo_feat = torch.cat([feat_l, feat_r], dim=1)
             depth_logits = self.depth_predictor(stereo_feat)
             seg_logits = self.seg_decoder(feat_l, skips, self._image_h, self._image_w)
-
             cam_ext = self._batch_cam_ext(cam_ext, B, left_rgb.device)
             bev_feat = self.lifter(feat_l, depth_logits, K, cam_ext)
             bev_feat = self.bev_encoder(bev_feat)
             occ_logits = self.occ_head(bev_feat)
             bev_seg_logits = self.bev_seg_head(bev_feat)
+            return bev_feat, occ_logits, bev_seg_logits, depth_logits, seg_logits
 
-            return seg_logits, occ_logits, bev_seg_logits, depth_logits
+        def freeze_perception(self):
+            """Train only the control policy / critic / occ query (PPO)."""
+            for name, p in self.named_parameters():
+                p.requires_grad = (
+                    name.startswith("control_head.mlp")
+                    or name.startswith("control_head.critic")
+                    or name.startswith("control_head.log_std")
+                    or name.startswith("control_head.occ_proj")
+                )
 
-        def infer(self, left_rgb, right_rgb, K, device=None, cam_ext=None):
+        def forward(self, left_rgb, right_rgb, K, cam_ext=None, target=None):
+            """
+            Returns:
+                seg_logits:     (B, num_classes, H, W) image-space
+                occ_logits:     (B, grid_z, bev_h, bev_w) 3D occupancy
+                bev_seg_logits: (B, num_classes, Z, bev_h, bev_w) per-voxel class
+                depth_logits:   (B, D, Hf, Wf)
+                control:        (B, 3) throttle, brake, steer
+            """
+            bev_feat, occ_logits, bev_seg_logits, depth_logits, seg_logits = self.encode_bev(
+                left_rgb, right_rgb, K, cam_ext=cam_ext,
+            )
+            B = left_rgb.shape[0]
+            tgt = self._batch_target(target, B, left_rgb.device, bev_feat.dtype)
+            if tgt is None:
+                control = bev_feat.new_zeros(B, 3)
+            else:
+                control = self.control_head(bev_feat, occ_logits, tgt)
+            return seg_logits, occ_logits, bev_seg_logits, depth_logits, control
+
+        def infer(self, left_rgb, right_rgb, K, device=None, cam_ext=None,
+                  target=None, speed=0.0):
             """
             Inference from numpy arrays.
+
+            ``target`` is ego-FLU (x, y, yaw[, speed]). ``speed`` fills the
+            last slot when ``target`` is length 3.
 
             Returns:
                 seg_classes:     (H, W) uint8 image-space segmentation
                 occ_map:         (grid_z, bev_h, bev_w) uint8 binary 3D occupancy
-                bev_seg_classes: (bev_h, bev_w) uint8 per-cell BEV class
+                bev_seg_classes: (Z, bev_h, bev_w) uint8 per-voxel class
                 depth_map:       (H, W) float32 meters
+                control:         (3,) float32 throttle, brake, steer
             """
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -398,22 +629,30 @@ if HAS_TORCH:
             std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
             def to_tensor(img):
-                t = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0) / 255.0
-                return ((t - mean) / std).to(device)
+                rgb = np.ascontiguousarray(np.asarray(img)[:, :, ::-1])
+                t = torch.from_numpy(rgb).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+                return (t.to(device) - mean) / std
 
             left_t = to_tensor(left_rgb)
             right_t = to_tensor(right_rgb)
-            K_t = torch.from_numpy(K).float().unsqueeze(0).to(device)
+            K_t = torch.from_numpy(np.asarray(K)).float().unsqueeze(0).to(device)
+            tgt = None
+            if target is not None:
+                t = np.asarray(target, dtype=np.float32).reshape(-1)
+                sp = float(t[3]) if t.size >= 4 else float(speed)
+                tgt = torch.tensor([[float(t[0]), float(t[1]), float(t[2]), sp]],
+                                   device=device, dtype=torch.float32)
 
             self.eval()
             with torch.no_grad():
-                seg_logits, occ_logits, bev_seg_logits, depth_logits = self(
-                    left_t, right_t, K_t, cam_ext=cam_ext,
+                seg_logits, occ_logits, bev_seg_logits, depth_logits, control = self(
+                    left_t, right_t, K_t, cam_ext=cam_ext, target=tgt,
                 )
 
             seg_classes = seg_logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
             occ_map = (torch.sigmoid(occ_logits) > 0.5).squeeze(0).cpu().numpy().astype(np.uint8)
             bev_seg_classes = bev_seg_logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+            control_np = control.squeeze(0).cpu().numpy().astype(np.float32)
 
             D = depth_logits.shape[1]
             depth_bins = torch.linspace(1.0, 80.0, D).to(device)
@@ -424,7 +663,7 @@ if HAS_TORCH:
                 mode="bilinear", align_corners=False,
             ).squeeze().cpu().numpy()
 
-            return seg_classes, occ_map, bev_seg_classes, depth_map
+            return seg_classes, occ_map, bev_seg_classes, depth_map, control_np
 
 
 # ════════════════════════════════════════════════════════════════
@@ -433,31 +672,54 @@ if HAS_TORCH:
 
 if HAS_TORCH:
 
-    def stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt,
-                        seg_weight=1.0, occ_weight=1.0, bev_seg_weight=1.0, occ_pos_weight=5.0):
+    def stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, occupancy_seg_gt,
+                        seg_weight=1.0, occ_weight=1.0, bev_seg_weight=1.0, occ_pos_weight=5.0,
+                        control_pred=None, control_gt=None, has_control=None,
+                        control_weight=1.0):
         """
-        Combined loss for image-space segmentation + 3D occupancy + BEV semantics.
+        Combined loss for image-space segmentation + 3D occupancy + BEV semantics
+        + optional imitation control (throttle, brake, steer).
 
         Args:
             seg_logits:     (B, C, H, W) image-space logits
             occ_logits:     (B, Z, bev_h, bev_w) 3D occupancy logits
-            bev_seg_logits: (B, C, bev_h, bev_w) BEV per-cell class logits
+            bev_seg_logits: (B, C, Z, bev_h, bev_w) per-voxel class logits
             seg_gt:         (B, H, W) long — image-space class indices
             occ_gt:         (B, Z, bev_h, bev_w) float — 3D occupancy
-            bev_seg_gt:     (B, bev_h, bev_w) long — BEV per-cell class indices
+            occupancy_seg_gt: (B, C, Z, bev_h, bev_w) class hits, or (B, Z, H, W) indices
+            control_pred:   (B, 3) optional predicted CARLA control
+            control_gt:     (B, 3) optional expert CARLA control
+            has_control:    (B,) mask; 0 skips imitation on that sample
         """
         seg_loss = F.cross_entropy(seg_logits, seg_gt)
         pos_w = occ_logits.new_tensor(occ_pos_weight)
         occ_loss = F.binary_cross_entropy_with_logits(
             occ_logits, occ_gt.float(), pos_weight=pos_w,
         )
-        bev_seg_loss = F.cross_entropy(bev_seg_logits, bev_seg_gt)
+        if occupancy_seg_gt.dim() == bev_seg_logits.dim():
+            seg_idx = occupancy_seg_gt.argmax(dim=1)
+        else:
+            seg_idx = occupancy_seg_gt
+        bev_seg_loss = F.cross_entropy(bev_seg_logits, seg_idx.long())
         total = seg_weight * seg_loss + occ_weight * occ_loss + bev_seg_weight * bev_seg_loss
+        ctrl_loss = occ_logits.new_zeros(())
+        if control_pred is not None and control_gt is not None:
+            per = F.smooth_l1_loss(control_pred, control_gt.float(), reduction="none").mean(dim=1)
+            if has_control is None:
+                ctrl_loss = per.mean()
+                total = total + control_weight * ctrl_loss
+            else:
+                w = has_control.reshape(-1).to(dtype=per.dtype)
+                wsum = w.sum()
+                if float(wsum.detach()) > 0.0:
+                    ctrl_loss = (per * w).sum() / wsum
+                    total = total + control_weight * ctrl_loss
         return {
             "loss": total,
             "seg_loss": seg_loss,
             "occ_loss": occ_loss,
             "bev_seg_loss": bev_seg_loss,
+            "control_loss": ctrl_loss,
         }
 
 

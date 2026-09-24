@@ -76,7 +76,7 @@ python run_bev.py
 | `depth.py` | CARLA depth sensor decoding, depth→point cloud |
 | `segmentation.py` | CARLA tag→BEV class remapping (10 classes) |
 | `bev_grid.py` | Axis-aligned voxel grid, lifting, projection |
-| `query_heads.py` | StereoBEVModel (LSS) + geometric baseline heads |
+| `query_heads.py` | StereoBEVModel (LSS) + depth/seg/occ/control heads |
 | `camera_rig.py` | Stereo rig: left/right RGB + depth + seg on left |
 | `visualize.py` | BEV map rendering, depth heatmaps, legend |
 | `main.py` | Full perception loop (geometric or model mode) |
@@ -92,6 +92,7 @@ python run_bev.py
 | **BEV encoder** | 3-layer CNN refines BEV features (64ch) |
 | **Seg head** | Conv → per-cell class logits |
 | **Occ head** | Conv → per-cell occupancy logit |
+| **Control head** | Query BEV at ego + target pose → throttle, brake, steer |
 
 ## BEV Grid Parameters
 
