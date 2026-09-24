@@ -25,8 +25,8 @@ ok = kv.put_npz(
     right_rgb=np.zeros((540, 960, 3), dtype=np.uint8),
     depth_gt=np.ones((100, 100), dtype=np.float32),
     seg_gt=np.zeros((100, 100), dtype=np.uint8),
-    occ_gt=np.ones((100, 100), dtype=np.uint8),
-    bev_seg_gt=np.zeros((100, 100), dtype=np.uint8),
+    occ_gt=np.ones((20, 100, 100), dtype=np.uint8),
+    occupancy_seg_gt=np.zeros((10, 20, 100, 100), dtype=np.float32),
     K=np.eye(3, dtype=np.float32),
 )
 assert ok, "PUT failed"
@@ -51,8 +51,8 @@ for i in range(1, 6):
         right_rgb=np.random.randint(0, 255, (540, 960, 3), dtype=np.uint8),
         depth_gt=np.random.rand(100, 100).astype(np.float32),
         seg_gt=np.random.randint(0, 10, (100, 100), dtype=np.uint8),
-        occ_gt=np.random.randint(0, 2, (100, 100), dtype=np.uint8),
-        bev_seg_gt=np.random.randint(0, 10, (100, 100), dtype=np.uint8),
+        occ_gt=np.random.randint(0, 2, (20, 100, 100), dtype=np.uint8),
+        occupancy_seg_gt=np.random.rand(10, 20, 100, 100).astype(np.float32),
         K=np.eye(3, dtype=np.float32),
     )
 print(f"PUT 5 more: OK, total {PREFIX} count = {kv.count(PREFIX)}")

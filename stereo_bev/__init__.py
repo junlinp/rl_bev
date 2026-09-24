@@ -22,6 +22,7 @@ try:
     from .query_heads import (
         StereoBEVModel,
         OccQueryHead,
+        ControlQueryHead,
         stereo_bev_loss,
         occupancy_iou_counts,
         occupancy_iou_from_counts,

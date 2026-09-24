@@ -1,10 +1,11 @@
 """
-Training script for StereoBEVModel with image-space segmentation.
+Training script for StereoBEVModel (stereo vision-action).
 
 The model predicts:
   - Per-pixel semantic segmentation in IMAGE SPACE (camera view)
   - Per-pixel depth from stereo
-  - 3D occupancy volume (lifted from depth + seg); occupancy is evaluated with IoU
+  - 3D occupancy volume (lifted from depth + K); occupancy is evaluated with IoU
+  - CARLA control (throttle, brake, steer) from BEV queries + target pose
 
 Usage:
     python train_bev.py --kv-url http://localhost:3000 --epochs 50 --batch-size 2
@@ -46,7 +47,7 @@ from minikeyvalue_client import MiniKV
 # ════════════════════════════════════════════════════════════════
 
 _NPZ_FIELDS = (
-    "left_rgb", "right_rgb", "K", "depth_gt", "seg_gt", "occ_gt", "bev_seg_gt",
+    "left_rgb", "right_rgb", "K", "depth_gt", "seg_gt", "occ_gt", "occupancy_seg_gt",
 )
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -70,29 +71,40 @@ def _norm_bufs(device: torch.device):
     return mean, std
 
 
-def _move_batch(left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext, device, mean, std, non_blocking):
+def _move_batch(left_t, right_t, K_t, seg_gt, occ_gt, occupancy_seg_gt, cam_ext,
+                target, control_gt, has_control, device, mean, std, non_blocking):
     left_t = left_t.to(device, non_blocking=non_blocking)
     right_t = right_t.to(device, non_blocking=non_blocking)
     K_t = K_t.to(device, non_blocking=non_blocking)
     seg_gt = seg_gt.to(device, non_blocking=non_blocking)
     occ_gt = occ_gt.to(device, non_blocking=non_blocking)
-    bev_seg_gt = bev_seg_gt.to(device, non_blocking=non_blocking)
+    occupancy_seg_gt = occupancy_seg_gt.to(device, non_blocking=non_blocking)
     cam_ext = cam_ext.to(device, non_blocking=non_blocking)
+    target = target.to(device, non_blocking=non_blocking)
+    control_gt = control_gt.to(device, non_blocking=non_blocking)
+    has_control = has_control.to(device, non_blocking=non_blocking)
     if left_t.dtype == torch.uint8:
         left_t = _imagenet_norm(left_t, mean, std)
         right_t = _imagenet_norm(right_t, mean, std)
-    return left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext
+    return left_t, right_t, K_t, seg_gt, occ_gt, occupancy_seg_gt, cam_ext, target, control_gt, has_control
 
 
 def _load_npz_file(npz) -> tuple:
-    missing = [k for k in _NPZ_FIELDS if k not in npz.files]
+    files = set(npz.files)
+    missing = [k for k in _NPZ_FIELDS if k not in files and not (k == "occupancy_seg_gt" and "bev_seg_gt" in files)]
     if missing:
         raise KeyError(
             f"Sample missing {missing}. Re-collect with "
             "collect_data.py --kv-url http://localhost:3000 "
-            "(run_collect_v2.py samples omit bev_seg_gt)."
+            "(run_collect_v2.py samples omit occupancy_seg_gt)."
         )
-    return tuple(npz[k] for k in _NPZ_FIELDS)
+    arrays = []
+    for k in _NPZ_FIELDS:
+        if k == "occupancy_seg_gt" and k not in files:
+            arrays.append(npz["bev_seg_gt"])
+        else:
+            arrays.append(npz[k])
+    return tuple(arrays)
 
 
 class StereoBEVDataset(Dataset):
@@ -103,9 +115,11 @@ class StereoBEVDataset(Dataset):
       depth_gt:   (H, W) float32 meters
       seg_gt:     (H, W) uint8 — IMAGE-SPACE segmentation (camera view)
       occ_gt:     (Z, bev_h, bev_w) uint8 — 3D occupancy (legacy 2D is re-lifted)
-      bev_seg_gt: (bev_h, bev_w) uint8 — BEV per-cell semantic class
+      occupancy_seg_gt: (C, Z, bev_h, bev_w) float — per-voxel class hits
       K:          (3, 3) float64 intrinsics
       cam_ext:    (4, 4) optional ego-from-camera
+      target:     (4,) optional ego-FLU (x, y, yaw, speed)
+      control_gt: (3,) optional expert throttle, brake, steer
 
     Loads from local .npz files or minikeyvalue (`--kv-url`).
     """
@@ -123,6 +137,9 @@ class StereoBEVDataset(Dataset):
         self.occ_head = GeometricOccHead(min_hits=2.0)
         self.legacy_cam_ext = ego_from_camera(pitch_deg=0.0).astype(np.float32)
         self.expected_occ = (self.bev.grid_z, self.bev.grid_h, self.bev.grid_w)
+        self.expected_seg = (
+            self.bev.num_classes, self.bev.grid_z, self.bev.grid_h, self.bev.grid_w,
+        )
         if kv_url:
             self.keys = MiniKV(kv_url).list_keys(kv_prefix)
             self.files = None
@@ -156,13 +173,28 @@ class StereoBEVDataset(Dataset):
             npz = self._client().get_npz(self.keys[idx])
         else:
             npz = np.load(self.files[idx])
-        left, right, K, depth_gt, seg_gt, occ_gt, bev_seg_gt = _load_npz_file(npz)
+        left, right, K, depth_gt, seg_gt, occ_gt, occupancy_seg_gt = _load_npz_file(npz)
         cam_ext = np.asarray(npz["cam_ext"], dtype=np.float32) if "cam_ext" in npz.files else self.legacy_cam_ext
-        if occ_gt.ndim != 3 or occ_gt.shape != self.expected_occ:
+        if occ_gt.shape != self.expected_occ or occupancy_seg_gt.shape != self.expected_seg:
             res = self.bev.bev_from_frame(depth_gt, seg_gt, K, cam_ext, max_depth=self.max_depth)
-            occ_gt = self.occ_head(res["occupancy_count"])
-            if bev_seg_gt.shape != (self.bev.grid_h, self.bev.grid_w):
-                bev_seg_gt = self.bev.get_bev_semantic(res["class_histogram"])
+            if occ_gt.shape != self.expected_occ:
+                occ_gt = self.occ_head(res["occupancy_count"])
+            if occupancy_seg_gt.shape != self.expected_seg:
+                occupancy_seg_gt = res["class_volume"]
+
+        if "control_gt" in npz.files and "target" in npz.files:
+            control_gt = np.asarray(npz["control_gt"], dtype=np.float32).reshape(-1)[:3]
+            if control_gt.size < 3:
+                control_gt = np.pad(control_gt, (0, 3 - control_gt.size))
+            target = np.asarray(npz["target"], dtype=np.float32).reshape(-1)
+            if target.size < 4:
+                target = np.pad(target, (0, 4 - int(target.size)))
+            target = target[:4]
+            has_control = 1.0
+        else:
+            control_gt = np.zeros(3, dtype=np.float32)
+            target = np.zeros(4, dtype=np.float32)
+            has_control = 0.0
 
         return (
             _bgr_to_nchw_uint8(left),
@@ -171,8 +203,11 @@ class StereoBEVDataset(Dataset):
             torch.from_numpy(np.ascontiguousarray(depth_gt)).float(),
             torch.from_numpy(np.ascontiguousarray(seg_gt)).long(),
             torch.from_numpy(np.ascontiguousarray(occ_gt)).float(),
-            torch.from_numpy(np.ascontiguousarray(bev_seg_gt)).long(),
+            torch.from_numpy(np.ascontiguousarray(occupancy_seg_gt)).float(),
             torch.from_numpy(np.ascontiguousarray(cam_ext)).float(),
+            torch.from_numpy(np.ascontiguousarray(target)).float(),
+            torch.from_numpy(np.ascontiguousarray(control_gt)).float(),
+            torch.tensor(has_control, dtype=torch.float32),
         )
 
 
@@ -262,14 +297,26 @@ def render_occ_comparison(
     return np.concatenate([gt_img, pred_img, overlay], axis=1)
 
 
+def _occupancy_seg_bev(vol: np.ndarray) -> np.ndarray:
+    """(C, Z, H, W) class hits or (Z, H, W) ids → (H, W) class ids."""
+    vol = np.asarray(vol)
+    if vol.ndim == 4:
+        return vol.sum(axis=1).argmax(axis=0).astype(np.uint8)
+    if vol.ndim == 3:
+        return vol.argmax(axis=0).astype(np.uint8)
+    return vol.astype(np.uint8)
+
+
 def render_bev_seg_comparison(
-    bev_seg_gt: np.ndarray,
+    occupancy_seg_gt: np.ndarray,
     bev_seg_pred: np.ndarray,
     scale: int = 3,
 ) -> np.ndarray:
-    """Side-by-side BEV per-cell semantic class: GT vs predicted."""
-    H, W = bev_seg_gt.shape
-    gt_up = cv2.resize(bev_seg_gt.astype(np.uint8), (W * scale, H * scale), interpolation=cv2.INTER_NEAREST)
+    """Side-by-side BEV semantic class: GT vs predicted, collapsed over height."""
+    occupancy_seg_gt = _occupancy_seg_bev(occupancy_seg_gt)
+    bev_seg_pred = _occupancy_seg_bev(bev_seg_pred)
+    H, W = occupancy_seg_gt.shape
+    gt_up = cv2.resize(occupancy_seg_gt.astype(np.uint8), (W * scale, H * scale), interpolation=cv2.INTER_NEAREST)
     pred_up = cv2.resize(bev_seg_pred.astype(np.uint8), (W * scale, H * scale), interpolation=cv2.INTER_NEAREST)
 
     gt_img = colorize_seg(gt_up)
@@ -288,7 +335,7 @@ def make_comparison_panel(
     seg_pred: np.ndarray,
     occ_gt: np.ndarray,
     occ_pred: np.ndarray,
-    bev_seg_gt: np.ndarray,
+    occupancy_seg_gt: np.ndarray,
     bev_seg_pred: np.ndarray,
 ) -> np.ndarray:
     """
@@ -334,7 +381,7 @@ def make_comparison_panel(
     row3 = occ_vis
 
     # row 4: BEV semantic class
-    bev_seg_vis = render_bev_seg_comparison(bev_seg_gt, bev_seg_pred, scale=2)
+    bev_seg_vis = render_bev_seg_comparison(occupancy_seg_gt, bev_seg_pred, scale=2)
     bev_seg_vis = resize(bev_seg_vis)
     row4 = bev_seg_vis
 
@@ -442,31 +489,40 @@ def _iou_counts(device):
 def evaluate(model, loader, device, mean, std, use_amp=False, non_blocking=False):
     """Return mean losses plus dataset-level occupancy IoU (voxel 3D and BEV)."""
     model.eval()
-    totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg")}
+    totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg", "control")}
     iou_counts = _iou_counts(device)
     n = 0
     amp_cm = torch.cuda.amp.autocast if use_amp else nullcontext
     with torch.no_grad():
-        for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt, cam_ext in loader:
-            left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext = _move_batch(
-                left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext,
+        for batch in loader:
+            left_t, right_t, K_t, _, seg_gt, occ_gt, occupancy_seg_gt, cam_ext, target, control_gt, has_control = batch
+            left_t, right_t, K_t, seg_gt, occ_gt, occupancy_seg_gt, cam_ext, target, control_gt, has_control = _move_batch(
+                left_t, right_t, K_t, seg_gt, occ_gt, occupancy_seg_gt, cam_ext,
+                target, control_gt, has_control,
                 device, mean, std, non_blocking,
             )
             with amp_cm():
-                seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t, cam_ext)
-                losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
+                seg_logits, occ_logits, bev_seg_logits, _, control = model(
+                    left_t, right_t, K_t, cam_ext, target=target,
+                )
+                losses = stereo_bev_loss(
+                    seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, occupancy_seg_gt,
+                    control_pred=control, control_gt=control_gt, has_control=has_control,
+                )
             _accumulate_occ_iou(iou_counts, occ_logits, occ_gt)
             bs = left_t.size(0)
             totals["loss"] += losses["loss"].detach() * bs
             totals["seg"] += losses["seg_loss"].detach() * bs
             totals["occ"] += losses["occ_loss"].detach() * bs
             totals["bev_seg"] += losses["bev_seg_loss"].detach() * bs
+            totals["control"] += losses["control_loss"].detach() * bs
             n += bs
     return {
         "loss": (totals["loss"] / n).item(),
         "seg": (totals["seg"] / n).item(),
         "occ": (totals["occ"] / n).item(),
         "bev_seg": (totals["bev_seg"] / n).item(),
+        "control": (totals["control"] / n).item(),
         "occ_iou": occupancy_iou_from_counts(iou_counts["inter"], iou_counts["union"]),
         "occ_bev_iou": occupancy_iou_from_counts(iou_counts["inter_bev"], iou_counts["union_bev"]),
     }
@@ -480,15 +536,17 @@ def log_visualizations(model, loader, writer, device, epoch, mean, std,
     amp_cm = torch.cuda.amp.autocast if use_amp else nullcontext
 
     with torch.no_grad():
-        for left_t, right_t, K_t, depth_gt_b, seg_gt_b, occ_gt_b, bev_seg_gt_b, cam_ext in loader:
-            left_t, right_t, K_t, _, _, _, cam_ext = _move_batch(
-                left_t, right_t, K_t, seg_gt_b, occ_gt_b, bev_seg_gt_b, cam_ext,
+        for batch in loader:
+            left_t, right_t, K_t, depth_gt_b, seg_gt_b, occ_gt_b, occupancy_seg_gt_b, cam_ext, target, control_gt, has_control = batch
+            left_t, right_t, K_t, _, _, _, cam_ext, target, _, _ = _move_batch(
+                left_t, right_t, K_t, seg_gt_b, occ_gt_b, occupancy_seg_gt_b, cam_ext,
+                target, control_gt, has_control,
                 device, mean, std, non_blocking,
             )
 
             with amp_cm():
-                seg_logits, occ_logits, bev_seg_logits, depth_logits = model(
-                    left_t, right_t, K_t, cam_ext,
+                seg_logits, occ_logits, bev_seg_logits, depth_logits, _ = model(
+                    left_t, right_t, K_t, cam_ext, target=target,
                 )
 
             B = left_t.size(0)
@@ -499,7 +557,10 @@ def log_visualizations(model, loader, writer, device, epoch, mean, std,
                 # predicted outputs
                 pred_seg = seg_logits[b].argmax(dim=0).cpu().numpy().astype(np.uint8)
                 pred_occ = (torch.sigmoid(occ_logits[b]).squeeze() > 0.5).cpu().numpy().astype(np.uint8)
-                pred_bev_seg = bev_seg_logits[b].argmax(dim=0).cpu().numpy().astype(np.uint8)
+                seg_log = bev_seg_logits[b]
+                if seg_log.dim() == 4:
+                    seg_log = seg_log.sum(dim=1)
+                pred_bev_seg = seg_log.argmax(dim=0).cpu().numpy().astype(np.uint8)
 
                 # predicted depth (from model)
                 D = depth_logits.shape[1]
@@ -515,7 +576,7 @@ def log_visualizations(model, loader, writer, device, epoch, mean, std,
                 gt_depth = depth_gt_b[b].numpy()
                 gt_seg = seg_gt_b[b].numpy().astype(np.uint8)
                 gt_occ = occ_gt_b[b].numpy().astype(np.uint8)
-                gt_bev_seg = bev_seg_gt_b[b].numpy().astype(np.uint8)
+                gt_bev_seg = occupancy_seg_gt_b[b].numpy().astype(np.uint8)
 
                 # left RGB (denormalize)
                 left_np = left_t[b].cpu().permute(1, 2, 0).numpy()
@@ -642,15 +703,25 @@ def train(
     if resume and os.path.isfile(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model" in ckpt:
-            model.load_state_dict(ckpt["model"])
-            optimizer.load_state_dict(ckpt["optimizer"])
-            scheduler.load_state_dict(ckpt["scheduler"])
+            missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+            if missing:
+                print(f"[Train] missing keys: {list(missing)[:8]}")
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception as exc:
+                print(f"[Train] optimizer/scheduler not restored ({exc})")
             if ckpt.get("scaler") is not None and use_amp:
-                scaler.load_state_dict(ckpt["scaler"])
+                try:
+                    scaler.load_state_dict(ckpt["scaler"])
+                except Exception:
+                    pass
             start_epoch = ckpt["epoch"] + 1
             print(f"[Train] Resumed at epoch {start_epoch}")
         else:
-            model.load_state_dict(ckpt)
+            missing, unexpected = model.load_state_dict(ckpt, strict=False)
+            if missing:
+                print(f"[Train] missing keys: {list(missing)[:8]}")
 
     writer = SummaryWriter(log_dir)
     print(f"[Train] TensorBoard: tensorboard --logdir {log_dir}")
@@ -658,20 +729,27 @@ def train(
     print(f"[Train] Training for {epochs} epochs...")
     for epoch in range(start_epoch, epochs):
         model.train()
-        totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg")}
+        totals = {k: torch.zeros((), device=device) for k in ("loss", "seg", "occ", "bev_seg", "control")}
         iou_counts = _iou_counts(device)
         n = 0
 
-        for left_t, right_t, K_t, _, seg_gt, occ_gt, bev_seg_gt, cam_ext in train_loader:
-            left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext = _move_batch(
-                left_t, right_t, K_t, seg_gt, occ_gt, bev_seg_gt, cam_ext,
+        for batch in train_loader:
+            left_t, right_t, K_t, _, seg_gt, occ_gt, occupancy_seg_gt, cam_ext, target, control_gt, has_control = batch
+            left_t, right_t, K_t, seg_gt, occ_gt, occupancy_seg_gt, cam_ext, target, control_gt, has_control = _move_batch(
+                left_t, right_t, K_t, seg_gt, occ_gt, occupancy_seg_gt, cam_ext,
+                target, control_gt, has_control,
                 device, mean, std, non_blocking,
             )
 
             optimizer.zero_grad(set_to_none=True)
             with amp_cm():
-                seg_logits, occ_logits, bev_seg_logits, _ = model(left_t, right_t, K_t, cam_ext)
-                losses = stereo_bev_loss(seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, bev_seg_gt)
+                seg_logits, occ_logits, bev_seg_logits, _, control = model(
+                    left_t, right_t, K_t, cam_ext, target=target,
+                )
+                losses = stereo_bev_loss(
+                    seg_logits, occ_logits, bev_seg_logits, seg_gt, occ_gt, occupancy_seg_gt,
+                    control_pred=control, control_gt=control_gt, has_control=has_control,
+                )
             scaler.scale(losses["loss"]).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -684,6 +762,7 @@ def train(
             totals["seg"] += losses["seg_loss"].detach() * bs
             totals["occ"] += losses["occ_loss"].detach() * bs
             totals["bev_seg"] += losses["bev_seg_loss"].detach() * bs
+            totals["control"] += losses["control_loss"].detach() * bs
             n += bs
 
         scheduler.step()
@@ -691,6 +770,7 @@ def train(
         train_seg = (totals["seg"] / n).item()
         train_occ = (totals["occ"] / n).item()
         train_bev_seg = (totals["bev_seg"] / n).item()
+        train_ctrl = (totals["control"] / n).item()
         train_occ_iou = occupancy_iou_from_counts(iou_counts["inter"], iou_counts["union"])
         train_occ_bev_iou = occupancy_iou_from_counts(iou_counts["inter_bev"], iou_counts["union_bev"])
 
@@ -699,6 +779,7 @@ def train(
         )
         val_loss, val_seg, val_occ, val_bev_seg = val["loss"], val["seg"], val["occ"], val["bev_seg"]
         val_occ_iou, val_occ_bev_iou = val["occ_iou"], val["occ_bev_iou"]
+        val_ctrl = val["control"]
 
         # save checkpoint
         torch.save({
@@ -717,6 +798,7 @@ def train(
         writer.add_scalars("occ_iou", {"train": train_occ_iou, "val": val_occ_iou}, epoch)
         writer.add_scalars("occ_bev_iou", {"train": train_occ_bev_iou, "val": val_occ_bev_iou}, epoch)
         writer.add_scalars("bev_seg_loss", {"train": train_bev_seg, "val": val_bev_seg}, epoch)
+        writer.add_scalars("control_loss", {"train": train_ctrl, "val": val_ctrl}, epoch)
         writer.add_scalar("lr", lr_now, epoch)
 
         if epoch % viz_every == 0 or epoch == epochs - 1:
@@ -731,9 +813,11 @@ def train(
         if (epoch + 1) % 5 == 0 or epoch == start_epoch:
             print(f"  epoch {epoch+1:3d}/{epochs}  "
                   f"train: loss={train_loss:.4f} seg={train_seg:.4f} occ={train_occ:.4f} "
-                  f"occ_iou={train_occ_iou:.4f} bev_iou={train_occ_bev_iou:.4f} bev_seg={train_bev_seg:.4f}  "
+                  f"occ_iou={train_occ_iou:.4f} bev_iou={train_occ_bev_iou:.4f} bev_seg={train_bev_seg:.4f} "
+                  f"ctrl={train_ctrl:.4f}  "
                   f"val: loss={val_loss:.4f} seg={val_seg:.4f} occ={val_occ:.4f} "
-                  f"occ_iou={val_occ_iou:.4f} bev_iou={val_occ_bev_iou:.4f} bev_seg={val_bev_seg:.4f}  "
+                  f"occ_iou={val_occ_iou:.4f} bev_iou={val_occ_bev_iou:.4f} bev_seg={val_bev_seg:.4f} "
+                  f"ctrl={val_ctrl:.4f}  "
                   f"lr={lr_now:.6f}", flush=True)
 
     writer.close()
@@ -752,7 +836,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-w", type=int, default=960)
     parser.add_argument("--image-h", type=int, default=540)
     parser.add_argument("--bev-range", type=float, default=None,
-                        help="Unused; occupancy volume is 0–20m / ±10m / −1–3m")
+                        help="Unused; occupancy volume is ±10m XY / −1–3m Z")
     parser.add_argument("--bev-voxel", type=float, default=DEFAULT_VOXEL)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--kv-url", default=None, help="minikeyvalue URL (e.g. http://localhost:3000)")

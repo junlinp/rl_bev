@@ -1,5 +1,8 @@
 """
-Collect stereo RGB + BEV ground truth from CARLA with nearby obstacles.
+Collect stereo RGB + BEV ground truth + expert control from CARLA.
+
+Saves stereo RGB, K, occupancy/seg GT, plus the 5 s target pose and
+autopilot (throttle, brake, steer) for the vision-action control head.
 
 Spawns NPC traffic near the ego vehicle to ensure objects appear
 within the 10m×10m×5m BEV grid.
@@ -8,12 +11,14 @@ Samples are stored only in minikeyvalue (default http://localhost:3000).
 
 Usage:
   python collect_data.py --samples 500 --val-ratio 0.2
+  python collect_data.py --trajectories --samples 2000 --episode-len 200
 """
 
 import os
 import io
 import argparse
 import random
+import math
 import numpy as np
 import carla
 import time
@@ -30,9 +35,59 @@ from stereo_bev.bev_grid import (
 )
 from stereo_bev.query_heads import GeometricSegHead, GeometricOccHead
 from stereo_bev.calibration import DEFAULT_PITCH_DEG
+from stereo_bev.occ_fusion import TemporalOccFusion
+from stereo_bev.global_target import GlobalTarget, yaw_from_R
 from minikeyvalue_client import MiniKV
 
 DEFAULT_KV_URL = "http://localhost:3000"
+
+def _speed(vehicle) -> float:
+    v = vehicle.get_velocity()
+    return math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+
+
+def _expert_control(vehicle) -> np.ndarray:
+    c = vehicle.get_control()
+    return np.array([c.throttle, c.brake, c.steer], dtype=np.float32)
+
+
+def _target_from_plan(plan, speed: float) -> np.ndarray:
+    t = np.asarray(plan["target_t"], dtype=np.float64).reshape(3)
+    R = np.asarray(plan["target_R"], dtype=np.float64).reshape(3, 3)
+    return np.array([t[0], t[1], yaw_from_R(R), speed], dtype=np.float32)
+
+
+def _cross_track(route_xy: np.ndarray, x: float = 0.0, y: float = 0.0) -> float:
+    if route_xy is None or len(route_xy) < 2:
+        return 0.0
+    d = np.linalg.norm(route_xy - np.array([x, y]), axis=1)
+    i = int(np.clip(np.argmin(d), 0, len(route_xy) - 2))
+    a, b = route_xy[i], route_xy[i + 1]
+    ab = b - a
+    denom = np.dot(ab, ab) + 1e-9
+    t = np.clip(np.dot(np.array([x, y]) - a, ab) / denom, 0.0, 1.0)
+    proj = a + t * ab
+    return float(np.linalg.norm(np.array([x, y]) - proj))
+
+
+def _world_xy_yaw(vehicle) -> np.ndarray:
+    tf = vehicle.get_transform()
+    return np.array(
+        [tf.location.x, tf.location.y, math.radians(tf.rotation.yaw)],
+        dtype=np.float32,
+    )
+
+
+def _attach_collision(world, vehicle):
+    hit = {"flag": False}
+    bp = world.get_blueprint_library().find("sensor.other.collision")
+    sensor = world.spawn_actor(bp, carla.Transform(), attach_to=vehicle)
+
+    def _on(_event):
+        hit["flag"] = True
+
+    sensor.listen(_on)
+    return sensor, hit
 
 
 def spawn_npc_traffic(world, tm, ego_vehicle, num_vehicles=15, num_walkers=10):
@@ -128,6 +183,9 @@ def collect(
     min_occupied: int = 50,  # min occupied cells to keep a sample
     min_classes: int = 2,    # min distinct BEV classes to keep a sample
     kv_url: str = DEFAULT_KV_URL,
+    use_occ_fusion: bool = True,
+    trajectories: bool = False,
+    episode_len: int = 200,
 ):
     if not kv_url:
         raise ValueError("kv_url is required; collect_data writes only to minikeyvalue")
@@ -143,8 +201,17 @@ def collect(
 
     num_val = int(num_samples * val_ratio)
     num_train = num_samples - num_val
-
     print(f"[Collect] Target: {num_train} train + {num_val} val = {num_samples} total")
+
+    if trajectories:
+        steps_per_sample = 1
+        min_occupied = 0
+        min_classes = 0
+        print(
+            f"[Collect] trajectory mode  expert=CARLA Traffic Manager autopilot  "
+            f"episode_len={episode_len}",
+            flush=True,
+        )
     print(f"[Collect] Filtering: min_occupied={min_occupied}, min_classes={min_classes}")
 
     client = carla.Client(host, port)
@@ -177,6 +244,11 @@ def collect(
     vehicle.set_autopilot(True, tm.get_port())
     loc = vehicle.get_location()
     print(f"[Collect] Ego at ({loc.x:.1f}, {loc.y:.1f}, {loc.z:.1f})")
+    world.tick()
+    collision_sensor, collision_hit = _attach_collision(world, vehicle)
+    global_tgt = GlobalTarget(
+        world, vehicle, horizon_s=5.0, d_min=5.0, d_max=bev_x_range[1], v_max=8.0,
+    )
 
     # ── spawn nearby NPC traffic ──
     print("[Collect] Spawning NPC traffic...", flush=True)
@@ -193,9 +265,18 @@ def collect(
     )
     seg_head = GeometricSegHead()
     occ_head = GeometricOccHead(min_hits=2.0)
+    occ_fusion = TemporalOccFusion(bev, occ_thresh=2.0) if use_occ_fusion else None
     cam_ext = rig.cam_extrinsic
     print(f"[Collect] Occupancy volume: {bev.grid_z}x{bev.grid_h}x{bev.grid_w}  "
           f"voxel={bev_voxel}m  pitch={pitch_deg}°")
+    if occ_fusion is not None:
+        print(
+            f"[Collect] temporal occupancy fusion  decay={occ_fusion.decay:.2f}  "
+            f"thresh={occ_fusion.occ_thresh:.2f}",
+            flush=True,
+        )
+    else:
+        print("[Collect] temporal occupancy fusion  off", flush=True)
 
     # warm up
     print("[Collect] Warming up...", flush=True)
@@ -207,6 +288,9 @@ def collect(
     collected = 0
     skipped = 0
     class_stats = np.zeros(NUM_BEV_CLASSES, dtype=np.int64)
+    episode_id = 0
+    step = 0
+    prev_remain = None
 
     print(f"[Collect] Collecting...", flush=True)
     try:
@@ -223,9 +307,19 @@ def collect(
             seg_image = remap_segmentation(data["seg_raw"])  # image-space segmentation (H, W)
             result = bev.bev_from_frame(depth, seg_image, rig.K, cam_ext, max_depth=max_depth)
 
+            tf = vehicle.get_transform()
+            ego_xy_yaw = (
+                float(tf.location.x), float(tf.location.y),
+                math.radians(tf.rotation.yaw),
+            )
             seg_gt = seg_image   # IMAGE-SPACE segmentation (camera view)
-            occ_gt = occ_head(result["occupancy_count"])  # (Z, H, W) 3D occupancy
-            bev_seg_gt = bev.get_bev_semantic(result["class_histogram"])
+            if occ_fusion is not None:
+                occ_gt, _ = occ_fusion.update(
+                    result["occupancy_count"], result["voxel_class"], ego_xy_yaw,
+                )
+            else:
+                occ_gt = occ_head(result["occupancy_count"])  # (Z, H, W)
+            occupancy_seg_gt = result["class_volume"]  # (C, Z, H, W)
             occ_bev = occupancy_to_bev(occ_gt)
 
             n_occupied = int(occ_gt.sum())
@@ -235,9 +329,46 @@ def collect(
                 skipped += 1
                 continue
 
+            speed = _speed(vehicle)
+            plan = global_tgt.update(speed=speed, n_knots=8)
+            target = _target_from_plan(plan, speed)
+            control_gt = _expert_control(vehicle)
+            remain = float(global_tgt._remaining_arclength())
+            progress_m = 0.0 if prev_remain is None else float(prev_remain - remain)
+            prev_remain = remain
+            cte = _cross_track(plan.get("route_ego"))
+            collided = bool(collision_hit["flag"])
+            collision_hit["flag"] = False
+            done = bool(trajectories and (collided or (step + 1) >= episode_len))
+
             # track stats (image-space)
             for c in range(NUM_BEV_CLASSES):
                 class_stats[c] += (seg_gt == c).sum()
+
+            sample_kw = dict(
+                left_rgb=data["left_rgb"],
+                right_rgb=data["right_rgb"],
+                depth_gt=depth,
+                seg_gt=seg_gt,
+                occ_gt=occ_gt,
+                occupancy_seg_gt=occupancy_seg_gt,
+                K=rig.K,
+                cam_ext=cam_ext,
+                x_range=np.array(bev_x_range, dtype=np.float32),
+                y_range=np.array(bev_y_range, dtype=np.float32),
+                z_range=np.array(bev_z_range, dtype=np.float32),
+                voxel_size=np.float32(bev_voxel),
+                control_gt=control_gt,
+                target=target,
+                episode_id=np.int32(episode_id),
+                step=np.int32(step),
+                done=np.uint8(done),
+                collided=np.uint8(collided),
+                speed=np.float32(speed),
+                progress_m=np.float32(progress_m),
+                cte=np.float32(cte),
+                world_xy_yaw=_world_xy_yaw(vehicle),
+            )
 
             if collected < num_train:
                 key = f"/train/sample_{train_count:06d}"
@@ -246,21 +377,7 @@ def collect(
                 key = f"/val/sample_{val_count:06d}"
                 val_count += 1
             buf = io.BytesIO()
-            np.savez_compressed(
-                buf,
-                left_rgb=data["left_rgb"],
-                right_rgb=data["right_rgb"],
-                depth_gt=depth,
-                seg_gt=seg_gt,
-                occ_gt=occ_gt,
-                bev_seg_gt=bev_seg_gt,
-                K=rig.K,
-                cam_ext=cam_ext,
-                x_range=np.array(bev_x_range, dtype=np.float32),
-                y_range=np.array(bev_y_range, dtype=np.float32),
-                z_range=np.array(bev_z_range, dtype=np.float32),
-                voxel_size=np.float32(bev_voxel),
-            )
+            np.savez_compressed(buf, **sample_kw)
             if not kv.put(key, buf.getvalue()):
                 raise OSError(f"PUT {key} failed on {kv_url}")
 
@@ -268,19 +385,43 @@ def collect(
             split = "train" if collected <= num_train else "val"
             if collected % 25 == 0 or collected == num_samples:
                 loc = vehicle.get_location()
-                occupied_classes = np.unique(bev_seg_gt[occ_bev > 0]) if n_occupied else []
+                seg_bev = occupancy_seg_gt.sum(axis=1).argmax(axis=0)
+                occupied_classes = np.unique(seg_bev[occ_bev > 0]) if n_occupied else []
                 class_names = [BEV_CLASSES.get(int(c), str(c)) for c in occupied_classes]
                 z_hit = int((occ_gt.reshape(occ_gt.shape[0], -1).sum(axis=1) > 0).sum())
                 print(
                     f"  [{split}] {collected}/{num_samples}  "
+                    f"ep={episode_id} step={step}  "
                     f"pos=({loc.x:.0f},{loc.y:.0f})  "
+                    f"thr={control_gt[0]:.2f} str={control_gt[2]:+.2f}  "
                     f"occ={n_occupied}/{occ_gt.size}  z_bins={z_hit}/{occ_gt.shape[0]}  "
                     f"classes={class_names}  "
                     f"skipped={skipped}",
                     flush=True,
                 )
 
+            if trajectories:
+                step += 1
+                if done:
+                    episode_id += 1
+                    step = 0
+                    prev_remain = None
+                    if occ_fusion is not None:
+                        occ_fusion.reset()
+                    vehicle.set_autopilot(False)
+                    sp = random.choice(spawn_points)
+                    vehicle.set_transform(sp)
+                    world.tick()
+                    vehicle.set_autopilot(True, tm.get_port())
+                    global_tgt.pick_destination()
+                    collision_hit["flag"] = False
+
     finally:
+        try:
+            collision_sensor.stop()
+            collision_sensor.destroy()
+        except Exception:
+            pass
         for actor in reversed(npcs):
             try:
                 if actor.is_alive:
@@ -330,6 +471,19 @@ if __name__ == "__main__":
     parser.add_argument("--min-occupied", type=int, default=50)
     parser.add_argument("--min-classes", type=int, default=2)
     parser.add_argument("--kv-url", default=DEFAULT_KV_URL, help="minikeyvalue URL")
+    parser.add_argument(
+        "--no-occ-fusion", action="store_true",
+        help="Disable multi-frame occupancy merge (single-frame lift only)",
+    )
+    parser.add_argument(
+        "--trajectories", action="store_true",
+        help="Save consecutive expert episodes (Traffic Manager autopilot); "
+             "disables occupancy skip so the sequence stays intact",
+    )
+    parser.add_argument(
+        "--episode-len", type=int, default=200,
+        help="Ticks per expert episode when --trajectories is set",
+    )
     args = parser.parse_args()
 
     collect(
@@ -339,4 +493,7 @@ if __name__ == "__main__":
         num_vehicles=args.num_vehicles, num_walkers=args.num_walkers,
         min_occupied=args.min_occupied, min_classes=args.min_classes,
         kv_url=args.kv_url,
+        use_occ_fusion=not args.no_occ_fusion,
+        trajectories=args.trajectories,
+        episode_len=args.episode_len,
     )

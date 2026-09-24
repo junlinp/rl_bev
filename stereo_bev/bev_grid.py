@@ -2,8 +2,9 @@
 
 import numpy as np
 
-# Local 3D occupancy volume (vehicle-center FLU: X forward, Y left, Z up)
-DEFAULT_X_RANGE = (0.0, 20.0)
+# Local 3D occupancy volume (vehicle-center FLU: X forward, Y left, Z up).
+# 100 x 100 x 20 cells at 0.2 m. Vehicle origin (0, 0, 0) is voxel (50, 50, 5).
+DEFAULT_X_RANGE = (-10.0, 10.0)
 DEFAULT_Y_RANGE = (-10.0, 10.0)
 DEFAULT_Z_RANGE = (-1.0, 3.0)
 DEFAULT_VOXEL = 0.2
@@ -18,14 +19,16 @@ def occupancy_to_bev(occ: np.ndarray) -> np.ndarray:
 
 class BEVGrid:
     """
-    Axis-aligned BEV grid in vehicle-center ego FLU.
+    Axis-aligned occupancy grid in vehicle-center ego FLU.
 
     Coordinate convention (right-hand, Z-up):
         X  → forward (vehicle heading, origin at the CARLA actor / car center)
         Y  → left
         Z  → up (height above ground)
 
-    The left camera sits about +1.5 m in X from this origin.
+    Default 0.2 m voxels: X,Y ∈ [-10, 10], Z ∈ [-1, 3] → (Z, Y, X) = 20×100×100.
+    The car sits at voxel (xi, yi, zi) = (50, 50, 5). The left camera is about
+    +1.5 m in X (voxel xi ≈ 57). Depth unprojection indexes this same grid.
 
     BEV cell (i, j) corresponds to:
         x = x_range[0] + (i + 0.5) * voxel_size
@@ -49,6 +52,14 @@ class BEVGrid:
         self.grid_w = int((x_range[1] - x_range[0]) / voxel_size)
         self.grid_h = int((y_range[1] - y_range[0]) / voxel_size)
         self.grid_z = int((z_range[1] - z_range[0]) / voxel_size)
+
+    def origin_index(self) -> tuple[int, int, int]:
+        """Voxel (xi, yi, zi) containing the vehicle origin (0, 0, 0)."""
+        vs = self.voxel_size
+        xi = int((0.0 - self.x_range[0]) / vs)
+        yi = int((0.0 - self.y_range[0]) / vs)
+        zi = int((0.0 - self.z_range[0]) / vs)
+        return xi, yi, zi
 
     # ── coordinate helpers ──
 
@@ -98,8 +109,9 @@ class BEVGrid:
 
         Returns dict with:
             occupancy_count: (grid_z, grid_h, grid_w) hit count
-            class_histogram: (num_classes, grid_h, grid_w) Z-sum, for the 2D BEV map
-            voxel_class:     (grid_z, grid_h, grid_w) per-voxel class (no Z collapse)
+            class_volume:    (num_classes, grid_z, grid_h, grid_w) per-voxel class hits
+            class_histogram: (num_classes, grid_h, grid_w) Z-sum of class_volume
+            voxel_class:     (grid_z, grid_h, grid_w) per-voxel argmax class
         """
         N = points_ego.shape[0]
         xi, yi = self.world_to_grid(points_ego[:, 0], points_ego[:, 1])
@@ -137,6 +149,7 @@ class BEVGrid:
 
         return {
             "occupancy_count": occ,
+            "class_volume": cls_3d,
             "class_histogram": cls_hist,
             "voxel_class": voxel_class,
         }
@@ -150,13 +163,17 @@ class BEVGrid:
         max_depth: float = 120.0,
     ) -> dict:
         """
-        Single-frame BEV generation: depth + seg → point cloud → voxelize.
+        Single-frame occupancy: depth ray hits → ego FLU → this voxel grid.
+
+        Each depth pixel is a camera ray. Unprojection uses K; ``cam_extrinsic``
+        maps camera XYZ into vehicle-center occupancy FLU; then scatter into
+        voxels whose origin is the car (default index (50, 50, 5)).
 
         Args:
             depth_map: (H, W) float depth in meters
             seg_map: (H, W) uint8 BEV class indices
             K: (3, 3) intrinsic matrix
-            cam_extrinsic: (4, 4) world-from-camera or ego-from-camera
+            cam_extrinsic: (4, 4) ego-from-camera
             max_depth: max depth to include
 
         Returns dict from voxelize()
@@ -167,6 +184,9 @@ class BEVGrid:
         if points_cam.shape[0] == 0:
             return {
                 "occupancy_count": np.zeros((self.grid_z, self.grid_h, self.grid_w), dtype=np.float32),
+                "class_volume": np.zeros(
+                    (self.num_classes, self.grid_z, self.grid_h, self.grid_w), dtype=np.float32,
+                ),
                 "class_histogram": np.zeros((self.num_classes, self.grid_h, self.grid_w), dtype=np.float32),
                 "voxel_class": np.zeros((self.grid_z, self.grid_h, self.grid_w), dtype=np.uint8),
             }
